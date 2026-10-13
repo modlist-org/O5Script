@@ -6,3 +6,5 @@
 *.suo
 .zig-cache/
 zig-out/
+native/.zig-cache/
+native/zig-out/
