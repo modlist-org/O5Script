@@ -34,8 +34,6 @@ pub const TokenType = enum {
     string,
     ident,
     host_tag,
-
-    // Keywords
     kw_let,
     kw_sta,
     kw_con,
@@ -51,7 +49,6 @@ pub const TokenType = enum {
     kw_tru,
     kw_fls,
 
-    // Operators
     plus,
     minus,
     star,
@@ -163,7 +160,6 @@ pub const Lexer = struct {
         const start = self.pos;
         const c = self.nextChar().?;
 
-        // Host Tag: #TagName
         if (c == '#') {
             while (self.peekChar()) |ch| {
                 if (std.ascii.isAlphanumeric(ch) or ch == '_') {
@@ -173,7 +169,6 @@ pub const Lexer = struct {
             return .{ .tag = .host_tag, .text = self.src[start + 1 .. self.pos] };
         }
 
-        // Numbers: 123, 12.34, .5
         if (std.ascii.isDigit(c) or (c == '.' and self.peekChar() != null and std.ascii.isDigit(self.peekChar().?))) {
             var has_dot = (c == '.');
             while (self.peekChar()) |ch| {
@@ -192,7 +187,6 @@ pub const Lexer = struct {
             return .{ .tag = .number, .text = num_str, .num_val = val };
         }
 
-        // Identifiers & Keywords
         if (std.ascii.isAlphabetic(c) or c == '_') {
             while (self.peekChar()) |ch| {
                 if (std.ascii.isAlphanumeric(ch) or ch == '_') {
@@ -218,7 +212,6 @@ pub const Lexer = struct {
             return .{ .tag = kw, .text = ident };
         }
 
-        // String: "..."
         if (c == '"') {
             while (self.peekChar()) |ch| {
                 if (ch == '"') {
@@ -233,7 +226,6 @@ pub const Lexer = struct {
             return .{ .tag = .string, .text = self.src[start..self.pos] };
         }
 
-        // Operators & Punctuation
         switch (c) {
             '+' => {
                 if (self.matchChar('=')) return .{ .tag = .plus_equal, .text = "+=" };
@@ -603,7 +595,6 @@ pub const Compiler = struct {
             self.skipTypeAnnotation();
             _ = self.match(.equal);
 
-            // 1. Module import: con Std = @("std"); or con Math = @("std.math");
             if (self.match(.at)) {
                 _ = self.match(.l_paren);
                 if (self.cur.tag == .string) {
@@ -627,13 +618,12 @@ pub const Compiler = struct {
                 }
             }
 
-            // 2. Submodule access: con Math = Std.Math;
             if (self.cur.tag == .ident) {
                 const target_id = self.cur.text;
                 if (self.findModule(target_id)) |mod| {
                     if (mod == .std and self.peek.tag == .dot) {
-                        self.advance(); // past target_id
-                        self.advance(); // past .
+                        self.advance();
+                        self.advance();
                         if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "math")) {
                             self.advance();
                             _ = self.match(.semicolon);
@@ -1143,20 +1133,19 @@ pub const Compiler = struct {
         if (self.cur.tag == .ident) {
             const name = self.cur.text;
 
-            // 1. Check if module access: Std.Math.tan() or Math.tan()
             if (self.findModule(name)) |mod| {
                 if (mod == .std and self.peek.tag == .dot) {
-                    self.advance(); // past Std
-                    self.advance(); // past .
+                    self.advance();
+                    self.advance();
                     if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "math") and self.peek.tag == .dot) {
-                        self.advance(); // past Math
-                        self.advance(); // past .
+                        self.advance();
+                        self.advance();
                         try self.parseMathMember();
                         return;
                     }
                 } else if (mod == .math and self.peek.tag == .dot) {
-                    self.advance(); // past Math
-                    self.advance(); // past .
+                    self.advance();
+                    self.advance();
                     try self.parseMathMember();
                     return;
                 }
@@ -1173,7 +1162,6 @@ pub const Compiler = struct {
                 }
                 _ = self.match(.r_paren);
 
-                // User-defined function call only
                 if (self.findFunc(name)) |fidx| {
                     const func = self.funcs[fidx];
                     _ = try self.emit(.call, @intCast(func.entry_ip));

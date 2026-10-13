@@ -4,11 +4,10 @@ public enum TokenType {
     Eof,
     Number,
     String,
-    StringPart,             // string literal chunk inside interpolation
+    StringPart,
     Identifier,
-    HostTag,                // #TagName
+    HostTag,
 
-    // Keywords
     Let,
     Sta,
     Con,
@@ -24,44 +23,44 @@ public enum TokenType {
     TypeNum,
     TypeStr,
 
-    // Operators
     Plus,
     Minus,
     Star,
     Slash,
     Percent,
-    AndAnd,                 // &&
-    OrOr,                   // ||
-    Bang,                   // !
-    Amp,                    // &
-    Pipe,                   // |
-    Caret,                  // ^
-    Tilde,                  // ~
-    LessLess,               // <<
-    GreaterGreater,         // >>
-    EqualEqual,             // ==
-    BangEqual,              // !=
-    Less,                   // <
-    LessEqual,              // <=
-    Greater,                // >
-    GreaterEqual,           // >=
-    Equal,                  // =
-    PlusEqual,              // +=
-    MinusEqual,             // -=
-    StarEqual,              // *=
-    SlashEqual,             // /=
-    Arrow,                  // =>
-    DotDot,                 // ..
-    Question,               // ?
-    Colon,                  // :
+    AndAnd,
+    OrOr,
+    Bang,
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    LessLess,
+    GreaterGreater,
+    EqualEqual,
+    BangEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Equal,
+    PlusEqual,
+    MinusEqual,
+    StarEqual,
+    SlashEqual,
+    Arrow,
+    Dot,
+    DotDot,
+    At,
+    Question,
+    Colon,
 
-    // Delimiters
-    LParen,                 // (
-    RParen,                 // )
-    LBrace,                 // {
-    RBrace,                 // }
-    Comma,                  // ,
-    Semicolon               // ;
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    Comma,
+    Semicolon
 }
 
 public readonly struct Token {

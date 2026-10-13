@@ -5,9 +5,6 @@ using O5Script.Native;
 
 namespace O5Script;
 
-/// <summary>
-/// Entry point for compiling and executing O5Script scripts.
-/// </summary>
 public static class O5ScriptEngine {
     public static bool IsAvailable => NativeO5Script.IsAvailable;
 

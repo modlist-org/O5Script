@@ -25,7 +25,6 @@ public sealed class Lexer {
             int start = _pos;
             char c = _src[_pos];
 
-            // 1. Host Tag: #TagName
             if (c == '#') {
                 _pos++;
                 int idStart = _pos;
@@ -37,25 +36,21 @@ public sealed class Lexer {
                 continue;
             }
 
-            // 2. String literal with interpolation: "hello {expr}"
             if (c == '"') {
                 TokenizeString(tokens);
                 continue;
             }
 
-            // 3. Numbers: 123, 123.456, .5
             if (char.IsDigit(c) || (c == '.' && _pos + 1 < _len && char.IsDigit(_src[_pos + 1]))) {
                 tokens.Add(ScanNumber());
                 continue;
             }
 
-            // 4. Identifiers & Keywords
             if (char.IsLetter(c) || c == '_') {
                 tokens.Add(ScanIdentifier());
                 continue;
             }
 
-            // 5. Operators & Punctuation
             _pos++;
             switch (c) {
                 case '+':
@@ -139,7 +134,6 @@ public sealed class Lexer {
                     tokens.Add(new Token(TokenType.Semicolon, ";", start, 1));
                     break;
                 default:
-                    // Unknown character, skip
                     break;
             }
         }
@@ -149,18 +143,17 @@ public sealed class Lexer {
     }
 
     private void TokenizeString(List<Token> tokens) {
-        int strStart = _pos++; // skip leading "
+        int strStart = _pos++;
         var sb = new StringBuilder();
         bool hasInterpolation = false;
 
         while (_pos < _len) {
             char c = _src[_pos];
             if (c == '"') {
-                _pos++; // skip closing "
+                _pos++;
                 break;
             }
 
-            // Escaped {{ or }}
             if (c == '{' && _pos + 1 < _len && _src[_pos + 1] == '{') {
                 sb.Append('{');
                 _pos += 2;
@@ -172,7 +165,6 @@ public sealed class Lexer {
                 continue;
             }
 
-            // Embedded interpolation: {expr}
             if (c == '{') {
                 hasInterpolation = true;
                 if (sb.Length > 0 || tokens.Count == 0 || tokens[^1].Type != TokenType.Plus) {
@@ -181,10 +173,9 @@ public sealed class Lexer {
                     sb.Clear();
                 }
 
-                _pos++; // skip {
+                _pos++;
                 tokens.Add(new Token(TokenType.LParen, "(", _pos - 1, 1));
 
-                // Scan inner expression until matching }
                 int braceDepth = 1;
                 int innerStart = _pos;
                 while (_pos < _len && braceDepth > 0) {
@@ -197,11 +188,10 @@ public sealed class Lexer {
                 }
 
                 string innerSrc = _src[innerStart.._pos];
-                if (_pos < _len && _src[_pos] == '}') _pos++; // skip }
+                if (_pos < _len && _src[_pos] == '}') _pos++;
 
                 var innerLexer = new Lexer(innerSrc);
                 var innerTokens = innerLexer.Tokenize();
-                // append all tokens except EOF
                 for (int i = 0; i < innerTokens.Count - 1; i++) {
                     tokens.Add(innerTokens[i]);
                 }
@@ -212,7 +202,6 @@ public sealed class Lexer {
                 continue;
             }
 
-            // Escaped characters: \n, \t, \"
             if (c == '\\' && _pos + 1 < _len) {
                 _pos++;
                 char esc = _src[_pos++];
@@ -234,7 +223,6 @@ public sealed class Lexer {
         if (!hasInterpolation || sb.Length > 0) {
             tokens.Add(new Token(TokenType.String, sb.ToString(), strStart, _pos - strStart));
         } else if (hasInterpolation && tokens.Count > 0 && tokens[^1].Type == TokenType.Plus) {
-            // remove trailing plus and add empty string if ended right after interpolation
             tokens.Add(new Token(TokenType.String, string.Empty, _pos, 0));
         }
     }
@@ -244,7 +232,7 @@ public sealed class Lexer {
         while (_pos < _len && char.IsDigit(_src[_pos])) _pos++;
 
         if (_pos < _len && _src[_pos] == '.' && _pos + 1 < _len && char.IsDigit(_src[_pos + 1])) {
-            _pos++; // skip '.'
+            _pos++;
             while (_pos < _len && char.IsDigit(_src[_pos])) _pos++;
         }
 
@@ -292,14 +280,12 @@ public sealed class Lexer {
                 continue;
             }
 
-            // Single line comment: //
             if (c == '/' && _pos + 1 < _len && _src[_pos + 1] == '/') {
                 _pos += 2;
                 while (_pos < _len && _src[_pos] != '\n') _pos++;
                 continue;
             }
 
-            // Multi line comment: /* */
             if (c == '/' && _pos + 1 < _len && _src[_pos + 1] == '*') {
                 _pos += 2;
                 while (_pos + 1 < _len && !(_src[_pos] == '*' && _src[_pos + 1] == '/')) {

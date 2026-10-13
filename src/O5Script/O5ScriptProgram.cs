@@ -6,9 +6,6 @@ using O5Script.Native;
 
 namespace O5Script;
 
-/// <summary>
-/// Compiled high-performance O5Script executable instance.
-/// </summary>
 public sealed class O5ScriptProgram : IDisposable {
     private long _handle;
     private readonly string[] _hostTags;
@@ -22,7 +19,6 @@ public sealed class O5ScriptProgram : IDisposable {
     internal unsafe O5ScriptProgram(long handle) {
         _handle = handle;
 
-        // 1. Read Host Tags
         nuint hostCount = NativeO5Script.o5s_host_tag_count(handle);
         _hostTags = new string[hostCount];
         byte[] buf = new byte[256];
@@ -33,7 +29,6 @@ public sealed class O5ScriptProgram : IDisposable {
             }
         }
 
-        // 2. Read Defined Tags
         nuint tagCount = NativeO5Script.o5s_tag_count(handle);
         _tags = new string[tagCount];
         _tagLookup = new Dictionary<string, int>((int)tagCount, StringComparer.Ordinal);

@@ -92,7 +92,6 @@ fn appendNumber(scratch: []u8, pos: *usize, num: f64) !void {
         return;
     }
 
-    // Check if integer
     if (num == @trunc(num) and @abs(num) < 9007199254740992.0) {
         const int_val: i64 = @intFromFloat(num);
         var buf: [32]u8 = undefined;
@@ -218,7 +217,6 @@ pub fn run(
                 sp -= 1;
 
                 if (l.val_type == .str or r.val_type == .str) {
-                    // String concatenation into scratch buffer
                     const start_pos = scratch_pos;
                     if (l.val_type == .str) {
                         try appendString(scratch, &scratch_pos, l.toSlice());

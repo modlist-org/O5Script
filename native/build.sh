@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
 TARGET="${1:-}"
 if [[ -n "$TARGET" ]]; then
     zig build --release=fast -Dtarget="$TARGET" --prefix "$HERE/zig-out"
@@ -25,5 +26,8 @@ if [[ -f "$HERE/zig-out/lib/$SRC" ]]; then
     cp -f "$HERE/zig-out/lib/$SRC" "$HERE/zig-out/lib/O5ScriptNative.$OS.$EXT"
 elif [[ -f "$HERE/zig-out/bin/$SRC" ]]; then
     cp -f "$HERE/zig-out/bin/$SRC" "$HERE/zig-out/lib/O5ScriptNative.$OS.$EXT"
+fi
+if [[ -f "$HERE/zig-out/bin/o5s" ]]; then
+    cp -f "$HERE/zig-out/bin/o5s" "$HERE/../o5s"
 fi
 ls -la "$HERE/zig-out/lib"

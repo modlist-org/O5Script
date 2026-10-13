@@ -1,27 +1,20 @@
 namespace O5Script.Common;
 
-/// <summary>
-/// Dense byte-sized machine opcodes for O5Script stack virtual machine.
-/// </summary>
 public enum O5OpCode : byte {
     Nop = 0,
-
-    // Stack operations & Literals
-    PushNum,      // arg: uint16 constIndex
-    Push0,        // pushes 0.0
-    Push1,        // pushes 1.0
-    PushStr,      // arg: uint16 stringIndex
+    PushNum,
+    Push0,
+    Push1,
+    PushStr,
     Pop,
     Dup,
 
-    // Variable Slots (Machine Registers)
-    LoadLocal,    // arg: uint16 localSlot
-    StoreLocal,   // arg: uint16 localSlot
-    LoadState,    // arg: uint16 stateSlot
-    StoreState,   // arg: uint16 stateSlot
-    LoadHost,     // arg: uint16 hostTagIndex
+    LoadLocal,
+    StoreLocal,
+    LoadState,
+    StoreState,
+    LoadHost,
 
-    // Arithmetic
     Add,
     Sub,
     Mul,
@@ -29,7 +22,6 @@ public enum O5OpCode : byte {
     Mod,
     Neg,
 
-    // Bitwise
     BitAnd,
     BitOr,
     BitXor,
@@ -37,7 +29,6 @@ public enum O5OpCode : byte {
     Shl,
     Shr,
 
-    // Comparison
     Eq,
     Ne,
     Lt,
@@ -45,20 +36,16 @@ public enum O5OpCode : byte {
     Gt,
     Ge,
 
-    // Logic
     Not,
 
-    // Control Flow
-    Jmp,          // arg: int16 relativeOffset
-    JmpIfZero,    // arg: int16 relativeOffset (pops and jumps if 0.0)
-    JmpIfNotZero, // arg: int16 relativeOffset (pops and jumps if != 0.0)
+    Jmp,
+    JmpIfZero,
+    JmpIfNotZero,
 
-    // Range / Count Loop Acceleration
-    LoopStep,     // arg: uint16 idxSlot, uint16 limitSlot, int16 backOffset
+    LoopStep,
 
-    // Functions & Builtins
-    CallBuiltin,  // arg: uint8 builtinId, uint8 argCount
-    Call,         // arg: uint16 funcIndex, uint8 argCount
+    CallBuiltin,
+    Call,
     Ret,
     Halt
 }

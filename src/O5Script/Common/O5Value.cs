@@ -3,9 +3,6 @@ using System.Globalization;
 
 namespace O5Script.Common;
 
-/// <summary>
-/// Fast zero-allocation tagged value for O5Script execution.
-/// </summary>
 public readonly struct O5Value : IEquatable<O5Value> {
     public readonly double Num;
     public readonly string? Str;
