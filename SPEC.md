@@ -72,17 +72,30 @@ Registers tags directly for the Overlayer engine:
   ```o5s
   tag Moon_CRot => rot;
   ```
-- Block evaluation:
+- Block evaluation (`ret` is optional; last expression automatically returned):
   ```o5s
   tag Moon_CRot => {
-      // calculations...
-      ret rot;
+      let diff = #CamRotRad - rot;
+      rot + diff * 0.5
   }
   ```
 
 ---
 
-## 4. Strings & Interpolation
+## 4. Evaluation Semantics
+
+- **Inline Expressions & Blocks (`{ ... }`)**:
+  `ret` is completely optional. The value of the last evaluated expression is automatically returned as the result:
+  ```o5s
+  {
+      let speed = #CurBpm;
+      speed > 300 ? "FAST" : "NORMAL"
+  }
+  ```
+- **Explicit `ret`**:
+  `ret <expr>;` is supported for early return from functions or blocks.
+
+## 5. Strings & Interpolation
 
 - String concatenation with `+` is supported (`"BPM: " + #CurBpm`).
 - Embedded string interpolation:
@@ -96,7 +109,7 @@ Registers tags directly for the Overlayer engine:
 
 ---
 
-## 5. Operators & Literals
+## 6. Operators & Literals
 
 ### Operators
 - Arithmetic: `+`, `-`, `*`, `/`, `%`
