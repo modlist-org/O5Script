@@ -313,4 +313,107 @@ test "string maximum length compile limit" {
     try std.testing.expectError(error.StringLiteralTooLong, compiler.compileSource(long_src[0..272], allocator));
 }
 
+test "block function with mandatory ret and type annotations" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun add(a: num, b: num): num {
+        \\    let sum = a + b;
+        \\    ret sum;
+        \\}
+        \\add(100, 200)
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 300.0), res.num);
+}
+
+test "block function without ret fails compile with MissingReturn" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun bad(a: num, b: num): num {
+        \\    a + b
+        \\}
+        \\bad(1, 2)
+    ;
+    try std.testing.expectError(error.MissingReturn, compiler.compileSource(src, allocator));
+}
+
+test "recursive function factorial and fibonacci" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun fact(n: num): num {
+        \\    if n <= 1 { ret 1; }
+        \\    ret n * fact(n - 1);
+        \\}
+        \\fact(5)
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 120.0), res.num);
+}
+
+test "forward declared functions" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun caller(x) => helper(x) + 1;
+        \\fun helper(x) => x * 2;
+        \\caller(10)
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 21.0), res.num);
+}
+
+test "tag function delegate" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun compute_rot() => #CamRotRad * 0.5;
+        \\tag Moon_CRot => compute_rot;
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), prog.tags.len);
+    try std.testing.expectEqualStrings("Moon_CRot", prog.tags[0].name);
+
+    const host_vars = [_]f64{ 40.0 };
+    const res = try vm.run(prog, prog.tags[0].entry_ip, &host_vars);
+    try std.testing.expectEqual(@as(f64, 20.0), res.num);
+}
+
+test "tag blocks with and without ret" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\tag ExplicitRet => {
+        \\    let a = 10;
+        \\    ret a * 2;
+        \\}
+        \\tag ImplicitRet => {
+        \\    let a = 10;
+        \\    a * 3
+        \\}
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const r1 = try vm.run(prog, prog.tags[0].entry_ip, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 20.0), r1.num);
+
+    const r2 = try vm.run(prog, prog.tags[1].entry_ip, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 30.0), r2.num);
+}
+
+test "undefined function and argument mismatch errors" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UndefinedFunction, compiler.compileSource("non_existent(1)", allocator));
+    try std.testing.expectError(error.ArgumentCountMismatch, compiler.compileSource("fun f(a, b) => a + b; f(1)", allocator));
+}
+
+
 

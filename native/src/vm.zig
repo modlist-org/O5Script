@@ -11,9 +11,9 @@ pub const TagDef = types.TagDef;
 pub const FuncDef = types.FuncDef;
 pub const O5Result = types.O5Result;
 
-pub const max_stack: usize = 64;
-pub const max_locals: usize = 128;
-pub const max_calls: usize = 32;
+pub const max_stack: usize = 256;
+pub const max_locals: usize = 512;
+pub const max_calls: usize = 64;
 pub const max_steps: usize = 1_000_000;
 
 threadlocal var thread_scratch: [65536]u8 = undefined;
@@ -119,8 +119,13 @@ pub fn run(
     var sp: usize = 0;
 
     var locals: [max_locals]Value = std.mem.zeroes([max_locals]Value);
-    var call_stack: [max_calls]usize = undefined;
+    const CallFrame = struct {
+        ret_ip: usize,
+        prev_fp: usize,
+    };
+    var call_stack: [max_calls]CallFrame = undefined;
     var csp: usize = 0;
+    var fp: usize = 0;
 
     var ip: usize = entry_ip;
     const ops = prog.ops;
@@ -175,7 +180,7 @@ pub fn run(
 
             .load_local => {
                 if (sp >= max_stack) return EvalError.StackOverflow;
-                const slot: usize = @intCast(op.arg);
+                const slot: usize = fp + @as(usize, @intCast(op.arg));
                 stack[sp] = if (slot < max_locals) locals[slot] else Value.fromNum(0.0);
                 sp += 1;
             },
@@ -183,7 +188,7 @@ pub fn run(
             .store_local => {
                 if (sp < 1) return EvalError.StackUnderflow;
                 sp -= 1;
-                const slot: usize = @intCast(op.arg);
+                const slot: usize = fp + @as(usize, @intCast(op.arg));
                 if (slot < max_locals) {
                     locals[slot] = stack[sp];
                 }
@@ -233,7 +238,7 @@ pub fn run(
                 sp -= 1;
                 if (idx_val.val_type != .num) return EvalError.InvalidType;
                 const idx: usize = @intFromFloat(idx_val.num);
-                const base: usize = @intCast(op.arg);
+                const base: usize = fp + @as(usize, @intCast(op.arg));
                 const slot = base + idx;
                 if (slot >= max_locals) return EvalError.OutOfBounds;
                 stack[sp] = locals[slot];
@@ -247,7 +252,7 @@ pub fn run(
                 sp -= 2;
                 if (idx_val.val_type != .num) return EvalError.InvalidType;
                 const idx: usize = @intFromFloat(idx_val.num);
-                const base: usize = @intCast(op.arg);
+                const base: usize = fp + @as(usize, @intCast(op.arg));
                 const slot = base + idx;
                 if (slot >= max_locals) return EvalError.OutOfBounds;
                 locals[slot] = val;
@@ -546,15 +551,20 @@ pub fn run(
 
             .call => {
                 if (csp >= max_calls) return EvalError.CallStackOverflow;
-                call_stack[csp] = ip;
+                const target_ip: usize = @intCast(@as(u32, @truncate(@as(u64, @bitCast(op.arg)))));
+                const frame_shift: usize = @intCast(@as(u32, @truncate(@as(u64, @bitCast(op.arg)) >> 32)));
+                if (fp + frame_shift >= max_locals) return EvalError.StackOverflow;
+                call_stack[csp] = .{ .ret_ip = ip, .prev_fp = fp };
                 csp += 1;
-                ip = @intCast(op.arg);
+                fp += frame_shift;
+                ip = target_ip;
             },
 
             .ret => {
                 if (csp > 0) {
                     csp -= 1;
-                    ip = call_stack[csp];
+                    ip = call_stack[csp].ret_ip;
+                    fp = call_stack[csp].prev_fp;
                 } else {
                     break;
                 }

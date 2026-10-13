@@ -33,6 +33,12 @@ pub const CompileError = error{
     TooManyDimensions,
     DimensionMismatch,
     ArraySizeMismatch,
+    TooManyFuncs,
+    TooManyCalls,
+    UndefinedFunction,
+    MissingReturn,
+    ExpectedFunctionBody,
+    ArgumentCountMismatch,
 };
 
 pub const TokenType = enum {
@@ -351,7 +357,18 @@ pub const Compiler = struct {
     arrays: [64]ArrayVar = undefined,
     array_count: usize = 0,
 
+    call_fixups: [64]CallFixup = undefined,
+    call_fixup_count: usize = 0,
+    current_func_had_ret: bool = false,
+
     allocator: std.mem.Allocator,
+
+    pub const CallFixup = struct {
+        op_idx: usize,
+        func_name: []const u8,
+        frame_offset: usize,
+        arg_count: usize,
+    };
 
     pub const ArrayInfo = struct {
         dims: [4]u32 = [_]u32{ 0, 0, 0, 0 },
@@ -504,6 +521,47 @@ pub const Compiler = struct {
         return null;
     }
 
+    fn registerFunc(self: *Compiler, name: []const u8, entry_ip: usize, param_count: usize) CompileError!usize {
+        if (self.func_count >= max_funcs) return error.TooManyFuncs;
+        const idx = self.func_count;
+        self.funcs[idx] = .{
+            .name = name,
+            .entry_ip = entry_ip,
+            .param_count = param_count,
+        };
+        self.func_count += 1;
+
+        for (self.call_fixups[0..self.call_fixup_count]) |*cf| {
+            if (std.mem.eql(u8, cf.func_name, name)) {
+                if (cf.arg_count != param_count) return error.ArgumentCountMismatch;
+                const packed_arg: i64 = @bitCast((@as(u64, @intCast(cf.frame_offset)) << 32) | @as(u64, @intCast(entry_ip)));
+                self.ops[cf.op_idx].arg = packed_arg;
+                cf.func_name = "";
+            }
+        }
+        return idx;
+    }
+
+    fn emitCall(self: *Compiler, name: []const u8, arg_count: usize) CompileError!void {
+        const frame_offset = self.local_count;
+        if (self.findFunc(name)) |fidx| {
+            const func = self.funcs[fidx];
+            if (func.param_count != arg_count) return error.ArgumentCountMismatch;
+            const packed_arg: i64 = @bitCast((@as(u64, @intCast(frame_offset)) << 32) | @as(u64, @intCast(func.entry_ip)));
+            _ = try self.emit(.call, packed_arg);
+        } else {
+            if (self.call_fixup_count >= 64) return error.TooManyCalls;
+            const op_idx = try self.emit(.call, 0);
+            self.call_fixups[self.call_fixup_count] = .{
+                .op_idx = op_idx,
+                .func_name = name,
+                .frame_offset = frame_offset,
+                .arg_count = arg_count,
+            };
+            self.call_fixup_count += 1;
+        }
+    }
+
     fn findModule(self: *Compiler, name: []const u8) ?ModuleKind {
         for (self.modules[0..self.module_count]) |m| {
             if (std.mem.eql(u8, m.name, name)) return m.kind;
@@ -546,6 +604,12 @@ pub const Compiler = struct {
             try self.parseStatement();
         }
         _ = try self.emit(.halt, 0);
+
+        for (self.call_fixups[0..self.call_fixup_count]) |cf| {
+            if (cf.func_name.len > 0) {
+                return error.UndefinedFunction;
+            }
+        }
 
         const prog = self.allocator.create(Prog) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(prog);
@@ -923,7 +987,8 @@ pub const Compiler = struct {
         }
 
         if (self.match(.kw_ret)) {
-            if (self.cur.tag != .semicolon and self.cur.tag != .r_brace) {
+            self.current_func_had_ret = true;
+            if (self.cur.tag != .semicolon and self.cur.tag != .r_brace and self.cur.tag != .eof) {
                 try self.parseExpression();
             } else {
                 _ = try self.emit(.push_0, 0);
@@ -946,11 +1011,19 @@ pub const Compiler = struct {
             }
 
             if (self.cur.tag == .l_brace) {
+                const saved_locals = self.local_count;
                 try self.parseBlock();
+                self.local_count = saved_locals;
+                _ = try self.emit(.halt, 0);
+            } else if (self.cur.tag == .ident and self.peek.tag != .l_paren and self.peek.tag != .dot and self.peek.tag != .l_bracket and (self.findFunc(self.cur.text) != null or (self.findLocal(self.cur.text) == null and self.findState(self.cur.text) == null))) {
+                const func_name = self.cur.text;
+                self.advance();
+                try self.emitCall(func_name, 0);
+                _ = try self.emit(.halt, 0);
             } else {
                 try self.parseExpression();
+                _ = try self.emit(.halt, 0);
             }
-            _ = try self.emit(.halt, 0);
             self.patchJump(skip_jmp, self.op_count);
             _ = self.match(.semicolon);
             return;
@@ -975,10 +1048,11 @@ pub const Compiler = struct {
 
             const skip_jmp = try self.emit(.jmp, 0);
             const entry_ip = self.op_count;
-            if (self.func_count < max_funcs) {
-                self.funcs[self.func_count] = .{ .name = name, .entry_ip = entry_ip, .param_count = param_count };
-                self.func_count += 1;
-            }
+            _ = try self.registerFunc(name, entry_ip, param_count);
+
+            const saved_locals = self.local_count;
+            self.local_count = 0;
+            const saved_arrays = self.array_count;
 
             var p = param_count;
             while (p > 0) {
@@ -991,9 +1065,18 @@ pub const Compiler = struct {
                 try self.parseExpression();
                 _ = try self.emit(.ret, 0);
             } else if (self.cur.tag == .l_brace) {
+                self.current_func_had_ret = false;
                 try self.parseBlock();
+                if (!self.current_func_had_ret) {
+                    return error.MissingReturn;
+                }
                 _ = try self.emit(.ret, 0);
+            } else {
+                return error.ExpectedFunctionBody;
             }
+
+            self.array_count = saved_arrays;
+            self.local_count = saved_locals;
             self.patchJump(skip_jmp, self.op_count);
             _ = self.match(.semicolon);
             return;
@@ -1576,7 +1659,7 @@ pub const Compiler = struct {
             self.advance();
 
             if (self.match(.l_paren)) {
-                var arg_count: u8 = 0;
+                var arg_count: usize = 0;
                 while (self.cur.tag != .r_paren and self.cur.tag != .eof) {
                     try self.parseExpression();
                     arg_count += 1;
@@ -1584,12 +1667,7 @@ pub const Compiler = struct {
                 }
                 _ = self.match(.r_paren);
 
-                if (self.findFunc(name)) |fidx| {
-                    const func = self.funcs[fidx];
-                    _ = try self.emit(.call, @intCast(func.entry_ip));
-                } else {
-                    _ = try self.emit(.push_0, 0);
-                }
+                try self.emitCall(name, arg_count);
                 return;
             }
 
@@ -1690,6 +1768,8 @@ pub const Compiler = struct {
                 sub_c.state_count = self.state_count;
                 sub_c.host_tags = self.host_tags;
                 sub_c.host_tag_count = self.host_tag_count;
+                sub_c.funcs = self.funcs;
+                sub_c.func_count = self.func_count;
                 sub_c.modules = self.modules;
                 sub_c.module_count = self.module_count;
                 sub_c.arrays = self.arrays;
@@ -1697,6 +1777,7 @@ pub const Compiler = struct {
 
                 try sub_c.parseExpression();
 
+                const base_op = self.op_count;
                 for (sub_c.ops[0..sub_c.op_count]) |op| {
                     if (op.code == .load_host) {
                         const hname = sub_c.host_tags[@intCast(op.arg)];
@@ -1704,6 +1785,19 @@ pub const Compiler = struct {
                         _ = try self.emit(.load_host, @intCast(hidx));
                     } else {
                         _ = try self.emit(op.code, op.arg);
+                    }
+                }
+
+                for (sub_c.call_fixups[0..sub_c.call_fixup_count]) |cf| {
+                    if (cf.func_name.len > 0) {
+                        if (self.call_fixup_count >= 64) return error.TooManyCalls;
+                        self.call_fixups[self.call_fixup_count] = .{
+                            .op_idx = base_op + cf.op_idx,
+                            .func_name = cf.func_name,
+                            .frame_offset = cf.frame_offset,
+                            .arg_count = cf.arg_count,
+                        };
+                        self.call_fixup_count += 1;
                     }
                 }
 

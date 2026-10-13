@@ -69,7 +69,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             return;
         };
 
-        printResult(res);
+        if (prog.tags.len == 0 or res.num != 0.0 or res.val_type == .str) {
+            printResult(res);
+        }
+        if (prog.tags.len > 0) {
+            for (prog.tags) |tag_def| {
+                const tag_res = vm.run(prog, tag_def.entry_ip, &[_]f64{}) catch continue;
+                std.debug.print("[Tag: #{s}] => ", .{tag_def.name});
+                printResult(tag_res);
+            }
+        }
         return;
     }
 

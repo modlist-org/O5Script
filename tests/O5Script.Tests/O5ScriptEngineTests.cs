@@ -201,4 +201,52 @@ public class O5ScriptEngineTests {
         // In native Zig, 1 million ops should complete in < 200ms (~50-150ns per op)
         Assert.True(sw.ElapsedMilliseconds < 500, $"1M executions took {sw.ElapsedMilliseconds}ms ({nsPerOp:F1} ns/op)");
     }
+
+    [Fact]
+    public void Function_BlockAndLambda_WithRecursion() {
+        string src = """
+        fun fact(n: num): num {
+            if n <= 1 { ret 1; }
+            ret n * fact(n - 1);
+        }
+        fun square(x: num): num => x * x;
+        fact(5) + square(10)
+        """;
+        double result = O5ScriptEngine.EvalNum(src);
+        Assert.Equal(220.0, result); // 120 + 100 = 220
+    }
+
+    [Fact]
+    public void Tag_FunctionDelegateAndBlockReturn() {
+        string src = """
+        fun compute_bpm() => #CurBpm * 2;
+        tag DoubleBpm => compute_bpm;
+        tag QuadBpm => {
+            let bpm = #CurBpm;
+            ret bpm * 4;
+        }
+        tag HalvedBpm => {
+            let bpm = #CurBpm;
+            bpm * 0.5
+        }
+        """;
+        using var prog = O5ScriptEngine.Compile(src);
+        Assert.Equal(3, prog.Tags.Count);
+
+        Span<double> hostVars = stackalloc double[] { 120.0 };
+        Assert.Equal(240.0, prog.EvalTagNum("DoubleBpm", hostVars));
+        Assert.Equal(480.0, prog.EvalTagNum("QuadBpm", hostVars));
+        Assert.Equal(60.0, prog.EvalTagNum("HalvedBpm", hostVars));
+    }
+
+    [Fact]
+    public void Function_MandatoryRet_Enforcement() {
+        string badSrc = """
+        fun bad(a: num, b: num): num {
+            a + b
+        }
+        bad(1, 2)
+        """;
+        Assert.Throws<InvalidOperationException>(() => O5ScriptEngine.Compile(badSrc));
+    }
 }
