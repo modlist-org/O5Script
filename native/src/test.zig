@@ -874,6 +874,194 @@ test "struct compile-time type errors" {
     , allocator));
 }
 
+test "pattern matching jmp with arrow ranges singles and or" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let num = 2;
+        \\let res = 0;
+        \\jmp num {
+        \\    0..1 => { res = 10; }
+        \\    10 => { res = 20; }
+        \\    2 | 3 => { res = 30; }
+        \\    _ => { res = 99; }
+        \\}
+        \\res
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 30.0), res.num);
+}
 
+test "jmp expression mode" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let number = 1;
+        \\let result = jmp number {
+        \\    1 => "숫자는 1입니다.",
+        \\    2 => "숫자는 2입니다.",
+        \\    _ => "1 또는 2가 아닙니다."
+        \\};
+        \\result
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqualStrings("숫자는 1입니다.", res.toSlice());
+}
 
+test "nested structs and chained dot access" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Point { x: num, y: num }
+        \\stu Rect { tl: Point, br: Point }
+        \\let r = Rect {
+        \\    tl: Point { x: 10, y: 20 },
+        \\    br: Point { x: 100, y: 200 }
+        \\};
+        \\r.tl.x = 15;
+        \\r.br.y += 50;
+        \\r.tl.x + r.br.y
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 265.0), res.num);
+}
 
+test "struct pass-by-ref vs pass-by-copy" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Vec2 { x: num, y: num }
+        \\fun mutate_ref(v: Vec2) {
+        \\    v.x = 999;
+        \\    ret 0;
+        \\}
+        \\fun mutate_copy(v: |Vec2|) {
+        \\    v.x = 111;
+        \\    ret 0;
+        \\}
+        \\let a = Vec2 { x: 1, y: 2 };
+        \\mutate_copy(a);
+        \\let after_copy = a.x;
+        \\mutate_ref(a);
+        \\let after_ref = a.x;
+        \\after_copy * 1000 + after_ref
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 1999.0), res.num);
+}
+
+test "function static variable sta persistence" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun ticker() {
+        \\    sta c = 0;
+        \\    c += 1;
+        \\    ret c;
+        \\}
+        \\let x = ticker();
+        \\let y = ticker();
+        \\let z = ticker();
+        \\x * 100 + y * 10 + z
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 123.0), res.num);
+}
+
+test "const parameter con compile error on mutation" {
+    const allocator = std.testing.allocator;
+    const valid_src =
+        \\fun read_only(con a: num) {
+        \\    ret a + 10;
+        \\}
+        \\read_only(5)
+    ;
+    const prog = try compiler.compileSource(valid_src, allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 15.0), res.num);
+
+    const invalid_src =
+        \\fun mutate_con(con a: num) {
+        \\    a = 20;
+        \\    ret 0;
+        \\}
+    ;
+    try std.testing.expectError(error.CannotAssignToConstant, compiler.compileSource(invalid_src, allocator));
+}
+
+test "struct reference vs value copy and lifetime check" {
+    const allocator = std.testing.allocator;
+    const ref_src =
+        \\stu Point { x: num, y: num }
+        \\let p1 = Point { x: 10, y: 20 };
+        \\let p2 = p1;
+        \\p2.x = 99;
+        \\p1.x
+    ;
+    const prog1 = try compiler.compileSource(ref_src, allocator);
+    defer prog1.deinit();
+    const res1 = try vm.run(prog1, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 99.0), res1.num); // Reference alias: mutating p2 mutates p1
+
+    const copy_src =
+        \\stu Point { x: num, y: num }
+        \\let p1 = Point { x: 10, y: 20 };
+        \\let p2: Point;
+        \\p2 = |p1|;
+        \\p2.x = 99;
+        \\p1.x
+    ;
+    const prog2 = try compiler.compileSource(copy_src, allocator);
+    defer prog2.deinit();
+    const res2 = try vm.run(prog2, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 10.0), res2.num); // Deep copy: p1 unaffected
+
+    const lifetime_src =
+        \\stu Point { x: num, y: num }
+        \\let p_outer: Point;
+        \\{
+        \\    let p_inner = Point { x: 1, y: 2 };
+        \\    p_outer = p_inner;
+        \\}
+    ;
+    try std.testing.expectError(error.LifetimeError, compiler.compileSource(lifetime_src, allocator));
+}
+
+test "dense jump table dispatch table_jmp" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun test_switch(x: num) {
+        \\    let r = jmp x {
+        \\        10 => 100,
+        \\        11 => 200,
+        \\        12 => 300,
+        \\        13 => 400,
+        \\        _ => -1,
+        \\    };
+        \\    ret r;
+        \\}
+        \\test_switch(12) + test_switch(10) + test_switch(99)
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    // Verify table_jmp opcode was emitted
+    var has_table_jmp = false;
+    for (prog.ops) |op| {
+        if (op.code == .table_jmp) {
+            has_table_jmp = true;
+            break;
+        }
+    }
+    try std.testing.expect(has_table_jmp);
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 300 + 100 + (-1) = 399
+    try std.testing.expectEqual(@as(f64, 399.0), res.num);
+}

@@ -111,6 +111,7 @@ pub const OpCode = enum(u8) {
     add_local,
     inc_local,
     dec_local,
+    table_jmp,
 };
 
 pub const Op = extern struct {

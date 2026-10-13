@@ -146,6 +146,18 @@ export fn o5s_asm_str_eq(l: *Value, r: *Value) callconv(.{ .x86_64_sysv = .{} })
     return 0;
 }
 
+export fn o5s_asm_str_copy(v: *Value) callconv(.{ .x86_64_sysv = .{} }) void {
+    if (v.val_type != .str or v.str_ptr == null or v.str_len == 0) return;
+    const scratch = &thread_scratch;
+    if (asm_scratch_pos + v.str_len > scratch.len) {
+        asm_scratch_pos = 0;
+    }
+    const start_pos = asm_scratch_pos;
+    @memcpy(scratch[start_pos .. start_pos + v.str_len], v.toSlice());
+    asm_scratch_pos += v.str_len;
+    v.* = Value.fromStr(scratch[start_pos .. start_pos + v.str_len]);
+}
+
 export fn o5s_asm_builtin_call(packed_arg: i64, stack_top: [*]Value) callconv(.{ .x86_64_sysv = .{} }) usize {
     const builtin_id: Builtin = @enumFromInt(@as(u8, @truncate(@as(u64, @bitCast(packed_arg)))));
     const arity: u8 = @truncate(@as(u64, @bitCast(packed_arg)) >> 8);
@@ -348,10 +360,10 @@ pub fn run(
                 const idx_val = stack[sp - 1];
                 sp -= 1;
                 if (idx_val.val_type != .num) return EvalError.InvalidType;
-                const idx: usize = @intFromFloat(idx_val.num);
-                const base: usize = fp + @as(usize, @intCast(op.arg));
-                const slot = base + idx;
-                if (slot >= max_locals) return EvalError.OutOfBounds;
+                const idx_int: i64 = @intFromFloat(idx_val.num);
+                const slot_i64 = @as(i64, @intCast(fp)) + op.arg + idx_int;
+                if (slot_i64 < 0 or slot_i64 >= max_locals) return EvalError.OutOfBounds;
+                const slot: usize = @intCast(slot_i64);
                 stack[sp] = locals[slot];
                 sp += 1;
             },
@@ -362,10 +374,10 @@ pub fn run(
                 const idx_val = stack[sp - 2];
                 sp -= 2;
                 if (idx_val.val_type != .num) return EvalError.InvalidType;
-                const idx: usize = @intFromFloat(idx_val.num);
-                const base: usize = fp + @as(usize, @intCast(op.arg));
-                const slot = base + idx;
-                if (slot >= max_locals) return EvalError.OutOfBounds;
+                const idx_int: i64 = @intFromFloat(idx_val.num);
+                const slot_i64 = @as(i64, @intCast(fp)) + op.arg + idx_int;
+                if (slot_i64 < 0 or slot_i64 >= max_locals) return EvalError.OutOfBounds;
+                const slot: usize = @intCast(slot_i64);
                 locals[slot] = val;
             },
 
@@ -707,6 +719,25 @@ pub fn run(
             .dec_local => {
                 const dest_slot: usize = @intCast(op.arg);
                 locals[fp + dest_slot].num -= 1.0;
+            },
+
+            .table_jmp => {
+                if (sp < 1) return EvalError.StackUnderflow;
+                const val_v = stack[sp - 1];
+                sp -= 1;
+                if (val_v.val_type != .num) return EvalError.InvalidType;
+                const min_val: i32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(op.arg)))));
+                const count: u32 = @truncate(@as(u64, @bitCast(op.arg)) >> 32);
+                const val_f = val_v.num;
+                const val_i: i64 = @intFromFloat(val_f);
+                if (val_f == @as(f64, @floatFromInt(val_i)) and val_i >= min_val and val_i < @as(i64, min_val) + @as(i64, count)) {
+                    const idx: usize = @intCast(val_i - min_val);
+                    ip = @intCast(ops[ip + 1 + idx].arg);
+                    continue;
+                } else {
+                    ip = @intCast(ops[ip + 1 + count].arg);
+                    continue;
+                }
             },
 
             .halt => {

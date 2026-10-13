@@ -1039,6 +1039,33 @@ op_dec_local:
     movsd [rbx + rdx*8], xmm0
     DISPATCH_NEXT
 
+.p2align 4
+op_table_jmp:
+    sub r10, 24
+    cvttsd2si rax, [r11 + r10]
+    cvtsi2sd xmm0, rax
+    ucomisd xmm0, [r11 + r10]
+    jp .Ltable_fallback
+    jne .Ltable_fallback
+    movsxd rdx, dword ptr [r12 + 8]
+    mov ecx, dword ptr [r12 + 12]
+    sub rax, rdx
+    cmp rax, rcx
+    jae .Ltable_fallback
+    shl rax, 4
+    mov rax, [r12 + 24 + rax]
+    shl rax, 4
+    lea r12, [r15 + rax]
+    DISPATCH_CUR
+.Ltable_fallback:
+    mov ecx, dword ptr [r12 + 12]
+    shl rcx, 4
+    mov rax, [r12 + 24 + rcx]
+    shl rax, 4
+    lea r12, [r15 + rax]
+    DISPATCH_CUR
+
+
 .section .rodata
 .p2align 3
 .Lconst_one:
@@ -1114,3 +1141,4 @@ o5s_dispatch_table:
     .long op_add_local - o5s_dispatch_table
     .long op_inc_local - o5s_dispatch_table
     .long op_dec_local - o5s_dispatch_table
+    .long op_table_jmp - o5s_dispatch_table
