@@ -1,7 +1,7 @@
 .intel_syntax noprefix
 .text
 
-# Macro for fast PIC direct dispatch
+# Layout contract: OpCode/Value in types.zig, Prog in vm.zig; Op is 16 bytes.
 .macro DISPATCH_NEXT
     movzx eax, byte ptr [r12 + 16]
     add r12, 16
@@ -20,14 +20,7 @@
 .globl o5s_vm_exec_x86_64
 .type o5s_vm_exec_x86_64, @function
 o5s_vm_exec_x86_64:
-    # Prototype:
-    # i32 o5s_vm_exec_x86_64(
-    #     Prog* prog,            // rdi
-    #     size_t entry_ip,       // rsi
-    #     const double* host_vars,// rdx
-    #     size_t host_count,     // rcx
-    #     O5Result* out_res      // r8
-    # )
+    # SysV ABI: rdi=Prog, rsi=entry IP, rdx=host vars, rcx=count, r8=result.
     push rbp
     mov rbp, rsp
     push rbx
@@ -36,42 +29,30 @@ o5s_vm_exec_x86_64:
     push r14
     push r15
 
-    # 16-byte stack alignment:
-    # 5 callee pushes (40) + rbp (8) + ret (8) = 56.
-    # 56 + 8 = 64 (0 mod 16).
+    # 64 KiB VM frame plus 8-byte padding for SysV call alignment.
     sub rsp, 65544
 
-    # Save arguments in stable rbp slots (below callee-saved registers rbp-40):
-    mov [rbp - 48], rdi          # [rbp - 48] = prog
-    mov r15, [rdi]               # r15 = prog.ops.ptr (permanent fast register)
-    mov [rbp - 88], rdx          # [rbp - 88] = host_vars
-    mov [rbp - 80], r8           # [rbp - 80] = out_res
-    mov [rbp - 56], rcx          # [rbp - 56] = host_count
-    lea r14, [rbp - 2048]        # r14 = call stack base
-    mov r13, r14                 # r13 = call stack pointer (grows upwards)
+    mov [rbp - 48], rdi
+    mov r15, [rdi]
+    mov [rbp - 88], rdx
+    mov [rbp - 80], r8
+    mov [rbp - 56], rcx
+    lea r14, [rbp - 2048]          # call-stack base
+    mov r13, r14
 
-    # Zero out locals [rsp .. rsp + 16384]
-    lea rdi, [rsp]
-    xor eax, eax
-    mov ecx, 2048
-    rep stosq
-
-    # r12 = current Op ptr = prog.ops.ptr + entry_ip * 16
+    # Bytecode writes every local before reading it; skip clearing the 16 KiB frame.
     shl rsi, 4
     lea r12, [r15 + rsi]
 
-    mov rbx, rsp                 # rbx = frame pointer (rsp + frame_offset)
-    xor r10, r10                 # r10 = 0 (eval_stack sp in bytes)
+    # VM state: r12=IP, r15=ops, rbx=locals, r10=stack depth, r11=stack, r9=dispatch.
+    # Rebuild r9/r11 after C calls; both are caller-saved.
+    mov rbx, rsp
+    xor r10, r10
 
-    lea r11, [rsp + 32768]       # r11 = eval_stack base
+    lea r11, [rsp + 32768]
     lea r9, [rip + o5s_dispatch_table]
 
-    # Initial dispatch
     DISPATCH_CUR
-
-# ---------------------------------------------------------------------------
-# Opcode Handlers
-# ---------------------------------------------------------------------------
 
 .p2align 4
 op_nop:
@@ -103,16 +84,16 @@ op_push_1:
 
 .p2align 4
 op_push_str:
-    mov eax, dword ptr [r12 + 8]      # offset
-    mov edx, dword ptr [r12 + 12]     # len
-    mov rdi, [rbp - 48]               # prog
-    mov rsi, [rdi + 16]               # string_pool.ptr
-    add rsi, rax                      # str_ptr
+    mov eax, dword ptr [r12 + 8]
+    mov edx, dword ptr [r12 + 12]
+    mov rdi, [rbp - 48]
+    mov rsi, [rdi + 16]
+    add rsi, rax
     xor eax, eax
-    mov [r11 + r10], rax              # num = 0.0
-    mov [r11 + r10 + 8], rsi          # str_ptr
-    mov [r11 + r10 + 16], edx         # str_len
-    mov byte ptr [r11 + r10 + 20], 1  # val_type = str
+    mov [r11 + r10], rax
+    mov [r11 + r10 + 8], rsi
+    mov [r11 + r10 + 16], edx
+    mov byte ptr [r11 + r10 + 20], 1
     add r10, 24
     DISPATCH_NEXT
 
@@ -154,19 +135,19 @@ op_store_local:
     mov rax, [r12 + 8]
     lea rdx, [rax + rax*2]
     lea rcx, [rbx + rdx*8]
-    cmp byte ptr [r12 + 16], 7        # is next op load_local?
+    # Fuse store_local/load_local when both target the same slot.
+    cmp byte ptr [r12 + 16], 7           # load_local
     jne .Lstore_normal
-    cmp [r12 + 24], rax               # same slot?
+    cmp [r12 + 24], rax
     jne .Lstore_normal
 
-    # Keep on stack! Copy to local and skip load_local:
     mov rax, [r11 + r10 - 24]
     mov [rcx], rax
     mov rax, [r11 + r10 - 16]
     mov [rcx + 8], rax
     mov rax, [r11 + r10 - 8]
     mov [rcx + 16], rax
-    add r12, 16                       # skip load_local
+    add r12, 16
     DISPATCH_NEXT
 
 .Lstore_normal:
@@ -184,8 +165,8 @@ op_load_state:
     mov rax, [r12 + 8]
     lea rax, [rax + rax*2]
     shl rax, 3
-    mov rdi, [rbp - 48]          # prog
-    mov rsi, [rdi + 80]          # prog.state_slots.ptr
+    mov rdi, [rbp - 48]
+    mov rsi, [rdi + 80]
     add rsi, rax
     mov rax, [rsi]
     mov [r11 + r10], rax
@@ -202,8 +183,8 @@ op_store_state:
     mov rax, [r12 + 8]
     lea rax, [rax + rax*2]
     shl rax, 3
-    mov rdi, [rbp - 48]          # prog
-    mov rsi, [rdi + 80]          # prog.state_slots.ptr
+    mov rdi, [rbp - 48]
+    mov rsi, [rdi + 80]
     add rsi, rax
     mov rax, [r11 + r10]
     mov [rsi], rax
@@ -259,14 +240,14 @@ op_load_local_elem:
     lea rax, [rax + rax*2]
     lea rcx, [rbx + rax*8]
 
-    cmp byte ptr [r12 + 16], 8         # is next op store_local?
+    # Fuse load_local_elem/store_local into a direct local copy.
+    cmp byte ptr [r12 + 16], 8           # store_local
     jne .Lload_elem_normal
 
-    # Direct copy from [rcx] to locals[dest]!
-    sub r10, 24                        # pop idx from stack
-    mov rdx, [r12 + 24]                # dest_slot
+    sub r10, 24
+    mov rdx, [r12 + 24]
     lea rdx, [rdx + rdx*2]
-    lea rdx, [rbx + rdx*8]             # rdx = pointer to locals[dest]
+    lea rdx, [rbx + rdx*8]
 
     mov rax, [rcx]
     mov [rdx], rax
@@ -274,7 +255,7 @@ op_load_local_elem:
     mov [rdx + 8], rax
     mov rax, [rcx + 16]
     mov [rdx + 16], rax
-    add r12, 16                        # skip store_local
+    add r12, 16
     DISPATCH_NEXT
 
 .Lload_elem_normal:
@@ -461,11 +442,12 @@ op_shr:
     DISPATCH_NEXT
 
 .p2align 4
+# Fuse a comparison followed by jmp_if_zero without materializing a boolean.
 op_eq:
     sub r10, 24
     movsd xmm0, [r11 + r10 - 24]
     movsd xmm1, [r11 + r10]
-    cmp byte ptr [r12 + 16], 37      # is next op jmp_if_zero?
+    cmp byte ptr [r12 + 16], 37          # jmp_if_zero
     je .Leq_fuse_jmp_zero
     ucomisd xmm0, xmm1
     sete al
@@ -494,7 +476,7 @@ op_ne:
     sub r10, 24
     movsd xmm0, [r11 + r10 - 24]
     movsd xmm1, [r11 + r10]
-    cmp byte ptr [r12 + 16], 37      # is next op jmp_if_zero?
+    cmp byte ptr [r12 + 16], 37          # jmp_if_zero
     je .Lne_fuse_jmp_zero
     ucomisd xmm0, xmm1
     setne al
@@ -524,7 +506,7 @@ op_lt:
     sub r10, 24
     movsd xmm0, [r11 + r10 - 24]
     movsd xmm1, [r11 + r10]
-    cmp byte ptr [r12 + 16], 37      # is next op jmp_if_zero?
+    cmp byte ptr [r12 + 16], 37          # jmp_if_zero
     je .Llt_fuse_jmp_zero
     ucomisd xmm0, xmm1
     setb al
@@ -551,7 +533,7 @@ op_le:
     sub r10, 24
     movsd xmm0, [r11 + r10 - 24]
     movsd xmm1, [r11 + r10]
-    cmp byte ptr [r12 + 16], 37      # is next op jmp_if_zero?
+    cmp byte ptr [r12 + 16], 37          # jmp_if_zero
     je .Lle_fuse_jmp_zero
     ucomisd xmm0, xmm1
     setbe al
@@ -578,7 +560,7 @@ op_gt:
     sub r10, 24
     movsd xmm0, [r11 + r10 - 24]
     movsd xmm1, [r11 + r10]
-    cmp byte ptr [r12 + 16], 37      # is next op jmp_if_zero?
+    cmp byte ptr [r12 + 16], 37          # jmp_if_zero
     je .Lgt_fuse_jmp_zero
     ucomisd xmm0, xmm1
     seta al
@@ -605,7 +587,7 @@ op_ge:
     sub r10, 24
     movsd xmm0, [r11 + r10 - 24]
     movsd xmm1, [r11 + r10]
-    cmp byte ptr [r12 + 16], 37      # is next op jmp_if_zero?
+    cmp byte ptr [r12 + 16], 37          # jmp_if_zero
     je .Lge_fuse_jmp_zero
     ucomisd xmm0, xmm1
     setae al
@@ -679,39 +661,40 @@ op_jmp_if_nonzero:
     DISPATCH_CUR
 
 .p2align 4
+# Inline cheap builtins; use helpers for the remaining math functions.
 op_call_builtin:
-    movzx eax, byte ptr [r12 + 8]      # builtin_id
-    cmp al, 7                          # Builtin.sqrt = 7
+    movzx eax, byte ptr [r12 + 8]
+    cmp al, 7                           # sqrt
     jne 1f
     sqrtsd xmm0, [r11 + r10 - 24]
     movsd [r11 + r10 - 24], xmm0
     DISPATCH_NEXT
 1:
-    cmp al, 8                          # Builtin.abs = 8
+    cmp al, 8                           # abs
     jne 2f
     mov rax, 0x7fffffffffffffff
     and [r11 + r10 - 24], rax
     DISPATCH_NEXT
 2:
-    cmp al, 9                          # Builtin.floor = 9
+    cmp al, 9                           # floor
     jne 3f
     roundsd xmm0, [r11 + r10 - 24], 1
     movsd [r11 + r10 - 24], xmm0
     DISPATCH_NEXT
 3:
-    cmp al, 10                         # Builtin.ceil = 10
+    cmp al, 10                          # ceil
     jne 4f
     roundsd xmm0, [r11 + r10 - 24], 2
     movsd [r11 + r10 - 24], xmm0
     DISPATCH_NEXT
 4:
-    cmp al, 11                         # Builtin.round = 11
+    cmp al, 11                          # round
     jne 5f
     roundsd xmm0, [r11 + r10 - 24], 0
     movsd [r11 + r10 - 24], xmm0
     DISPATCH_NEXT
 5:
-    test al, al                        # Builtin.sin = 0
+    test al, al                         # sin
     jne 6f
     movsd xmm0, [r11 + r10 - 24]
     mov [rbp - 72], r10
@@ -722,7 +705,7 @@ op_call_builtin:
     movsd [r11 + r10 - 24], xmm0
     DISPATCH_NEXT
 6:
-    cmp al, 1                          # Builtin.cos = 1
+    cmp al, 1                           # cos
     jne 7f
     movsd xmm0, [r11 + r10 - 24]
     mov [rbp - 72], r10
@@ -744,16 +727,17 @@ op_call_builtin:
     DISPATCH_NEXT
 
 .p2align 4
+# The call arg packs target IP (low 32 bits) and frame shift in bytes (high 32).
 op_call:
-    mov eax, dword ptr [r12 + 8]      # target_ip
-    mov edx, dword ptr [r12 + 12]     # precomputed frame_shift * 24 in bytes
+    mov eax, dword ptr [r12 + 8]
+    mov edx, dword ptr [r12 + 12]
 
-    lea rsi, [r12 + 16]              # return ip
-    mov [r13], rsi                   # save ret_ip
-    mov [r13 + 8], rbx               # save prev_fp
-    add r13, 16                      # push to call stack
+    lea rsi, [r12 + 16]
+    mov [r13], rsi
+    mov [r13 + 8], rbx
+    add r13, 16
 
-    add rbx, rdx                     # shift fp directly
+    add rbx, rdx
 
     shl rax, 4
     lea r12, [r15 + rax]
@@ -764,13 +748,13 @@ op_ret:
     cmp r13, r14
     jbe op_halt
     sub r13, 16
-    mov r12, [r13]                   # restore ret_ip
-    mov rbx, [r13 + 8]               # restore prev_fp
+    mov r12, [r13]
+    mov rbx, [r13 + 8]
     DISPATCH_CUR
 
 .p2align 4
 op_halt:
-    mov r13, [rbp - 80]              # restore out_res
+    mov r13, [rbp - 80]
     test r10, r10
     jz 1f
     mov rax, [r11 + r10 - 24]
@@ -797,42 +781,40 @@ op_halt:
     ret
 
 .p2align 4
+# Packed arg: value slot, limit slot, then loop body IP.
 op_loop_step:
-    mov rax, [r12 + 8]                 # packed_arg
-    movzx edx, ax                      # edx = vslot
+    mov rax, [r12 + 8]
+    movzx edx, ax
     shr rax, 16
-    movzx ecx, ax                      # ecx = limit_slot
-    shr rax, 16                        # rax = target_ip
+    movzx ecx, ax
+    shr rax, 16
 
-    # Check if target_ip is immediately preceding and is op_add_local (opcode 44)
     mov rsi, rax
     shl rsi, 4
-    add rsi, r15                       # rsi = pointer to target Op
+    add rsi, r15
     lea rdi, [rsi + 16]
-    cmp rdi, r12                       # does loop body consist solely of target Op?
+    cmp rdi, r12
     jne .Lloop_step_normal
 
-    cmp byte ptr [rsi], 44             # is target Op opcode 44 (add_local)?
+    # Fuse the exact one-op `sum += i` loop; preserve floating-point addition order.
+    cmp byte ptr [rsi], 44               # add_local
     jne .Lloop_step_normal
 
-    # FAST TIGHT ACCUMULATOR LOOP!
     mov r8, [rsi + 8]
-    movzx edi, r8w                     # edi = dest_slot
+    movzx edi, r8w
     shr r8, 16
-    movzx esi, r8w                     # esi = src_slot
-    cmp esi, edx                       # is src_slot == vslot (adding the loop counter)?
+    movzx esi, r8w
+    cmp esi, edx
     jne .Lloop_step_normal
 
-    # Match! Tight numeric accumulator loop:
     lea rdi, [rdi + rdi*2]
     lea rdx, [rdx + rdx*2]
     lea rcx, [rcx + rcx*2]
 
-    movsd xmm0, [rbx + rdx*8]          # counter (i)
-    movsd xmm1, [rbx + rcx*8]          # limit
-    movsd xmm2, [rbx + rdi*8]          # sum (s)
+    movsd xmm0, [rbx + rdx*8]
+    movsd xmm1, [rbx + rcx*8]
+    movsd xmm2, [rbx + rdi*8]
 
-    # First iteration increment that this loop_step was about to do:
     addsd xmm0, [rip + .Lconst_one]
     ucomisd xmm0, xmm1
     jae .Ltight_done
@@ -840,13 +822,13 @@ op_loop_step:
 
     movsd xmm3, xmm1
     subsd xmm3, xmm0
-    cvttsd2si rcx, xmm3                # rcx = remaining trip count
+    cvttsd2si rcx, xmm3
     test rcx, rcx
     jle .Ltight_done
 
     mov r8, rcx
-    and r8, 3                          # r8 = remainder
-    shr rcx, 2                         # rcx = 4-batch count
+    and r8, 3
+    shr rcx, 2
     test rcx, rcx
     jz .Ltight_rem
 
@@ -873,49 +855,45 @@ op_loop_step:
     jnz .Ltight_scalar
 
 .Ltight_done:
-    movsd [rbx + rdx*8], xmm0          # store final counter
-    movsd [rbx + rdi*8], xmm2          # store final sum
+    movsd [rbx + rdx*8], xmm0
+    movsd [rbx + rdi*8], xmm2
     DISPATCH_NEXT
 
 .Lloop_step_normal:
-    # Check if target_ip is an array accumulator loop (4 opcodes: load_local, load_local_elem, store_local, add_local)
+    # Fuse the exact four-op array accumulation loop emitted by the compiler.
     lea rdi, [rsi + 64]
     cmp rdi, r12
     jne .Lloop_step_fallback
 
-    cmp byte ptr [rsi], 7              # load_local
+    cmp byte ptr [rsi], 7                # load_local
     jne .Lloop_step_fallback
-    cmp byte ptr [rsi + 16], 13        # load_local_elem
+    cmp byte ptr [rsi + 16], 13          # load_local_elem
     jne .Lloop_step_fallback
-    cmp byte ptr [rsi + 32], 8         # store_local
+    cmp byte ptr [rsi + 32], 8           # store_local
     jne .Lloop_step_fallback
-    cmp byte ptr [rsi + 48], 44        # add_local
-    jne .Lloop_step_fallback
-
-    # Verify operands:
-    cmp [rsi + 8], rdx                 # load_local slot == idx_slot (edx)
+    cmp byte ptr [rsi + 48], 44          # add_local
     jne .Lloop_step_fallback
 
-    mov r8, [rsi + 48 + 8]             # add_local arg
-    movzx edi, r8w                     # dest_s
+    cmp [rsi + 8], rdx
+    jne .Lloop_step_fallback
+
+    mov r8, [rsi + 48 + 8]
+    movzx edi, r8w
     shr r8, 16
-    movzx r8d, r8w                     # src_v
-    cmp [rsi + 32 + 8], r8             # store_local slot == src_v
+    movzx r8d, r8w
+    cmp [rsi + 32 + 8], r8
     jne .Lloop_step_fallback
 
-    # Match! Fast tight array accumulation loop:
-    mov r14, [rsi + 16 + 8]            # a_base
+    mov r14, [rsi + 16 + 8]
 
-    # Convert counter (edx) and limit (ecx) to int:
     lea r8, [rdx + rdx*2]
-    cvttsd2si r8, [rbx + r8*8]         # r8 = current counter int
+    cvttsd2si r8, [rbx + r8*8]
     lea r9, [rcx + rcx*2]
-    cvttsd2si rcx, [rbx + r9*8]        # rcx = limit int
+    cvttsd2si rcx, [rbx + r9*8]
 
     lea rdi, [rdi + rdi*2]
-    movsd xmm2, [rbx + rdi*8]          # xmm2 = sum (s)
+    movsd xmm2, [rbx + rdi*8]
 
-    # First iteration step:
     inc r8
     cmp r8, rcx
     jae .Ltarry_done
@@ -924,7 +902,7 @@ op_loop_step:
 .Ltarry_step:
     lea rax, [r14 + r8]
     lea rax, [rax + rax*2]
-    addsd xmm2, [rbx + rax*8]          # s += a[counter].num
+    addsd xmm2, [rbx + rax*8]
     inc r8
     cmp r8, rcx
     jb .Ltarry_step
@@ -932,25 +910,26 @@ op_loop_step:
 .Ltarry_done:
     cvtsi2sd xmm0, r8
     lea rdx, [rdx + rdx*2]
-    movsd [rbx + rdx*8], xmm0          # store final counter
-    movsd [rbx + rdi*8], xmm2          # store final sum
-    lea r9, [rip + o5s_dispatch_table] # restore r9 dispatch table!
+    movsd [rbx + rdx*8], xmm0
+    movsd [rbx + rdi*8], xmm2
+    # Restore the dispatch table after using r9 for the limit slot.
+    lea r9, [rip + o5s_dispatch_table]
     DISPATCH_NEXT
 
 .Lloop_step_fallback:
-    lea rdx, [rdx + rdx*2]             # rdx = vslot * 3
-    lea rcx, [rcx + rcx*2]             # rcx = limit_slot * 3
+    lea rdx, [rdx + rdx*2]
+    lea rcx, [rcx + rcx*2]
 
-    movsd xmm0, [rbx + rdx*8]          # counter
-    addsd xmm0, [rip + .Lconst_one]    # counter += 1.0
-    movsd [rbx + rdx*8], xmm0          # store updated counter
+    movsd xmm0, [rbx + rdx*8]
+    addsd xmm0, [rip + .Lconst_one]
+    movsd [rbx + rdx*8], xmm0
 
-    ucomisd xmm0, [rbx + rcx*8]        # counter < limit
+    ucomisd xmm0, [rbx + rcx*8]
     jae .Lloop_step_exit
     jp .Lloop_step_exit
 
     shl rax, 4
-    lea r12, [r15 + rax]               # loop_body_ip
+    lea r12, [r15 + rax]
     DISPATCH_CUR
 
 .Lloop_step_exit:
@@ -958,22 +937,19 @@ op_loop_step:
 
 .p2align 4
 op_add_local:
-    mov rax, [r12 + 8]                 # packed_arg
-    movzx edx, ax                      # edx = dest_slot
+    mov rax, [r12 + 8]
+    movzx edx, ax
     shr rax, 16
-    movzx ecx, ax                      # ecx = src_slot
+    movzx ecx, ax
 
-    lea rdx, [rdx + rdx*2]             # rdx = dest_slot * 3
-    lea rcx, [rcx + rcx*2]             # rcx = src_slot * 3
+    lea rdx, [rdx + rdx*2]
+    lea rcx, [rcx + rcx*2]
 
     movsd xmm0, [rbx + rdx*8]
     addsd xmm0, [rbx + rcx*8]
     movsd [rbx + rdx*8], xmm0
     DISPATCH_NEXT
 
-# ---------------------------------------------------------------------------
-# Direct Relative Dispatch Table (45 opcodes, 4 bytes each, PIC-safe)
-# ---------------------------------------------------------------------------
 .section .rodata
 .p2align 3
 .Lconst_one:
@@ -982,49 +958,50 @@ op_add_local:
     .double 4.0
 
 .p2align 3
+# Keep this order in sync with OpCode in types.zig.
 o5s_dispatch_table:
-    .long op_nop - o5s_dispatch_table               # 0
-    .long op_push_num - o5s_dispatch_table           # 1
-    .long op_push_0 - o5s_dispatch_table             # 2
-    .long op_push_1 - o5s_dispatch_table             # 3
-    .long op_push_str - o5s_dispatch_table           # 4
-    .long op_pop - o5s_dispatch_table                # 5
-    .long op_dup - o5s_dispatch_table                # 6
-    .long op_load_local - o5s_dispatch_table         # 7
-    .long op_store_local - o5s_dispatch_table        # 8
-    .long op_load_state - o5s_dispatch_table         # 9
-    .long op_store_state - o5s_dispatch_table        # 10
-    .long op_load_host - o5s_dispatch_table          # 11
-    .long op_check_bounds - o5s_dispatch_table       # 12
-    .long op_load_local_elem - o5s_dispatch_table    # 13
-    .long op_store_local_elem - o5s_dispatch_table   # 14
-    .long op_load_state_elem - o5s_dispatch_table    # 15
-    .long op_store_state_elem - o5s_dispatch_table   # 16
-    .long op_add - o5s_dispatch_table                # 17
-    .long op_sub - o5s_dispatch_table                # 18
-    .long op_mul - o5s_dispatch_table                # 19
-    .long op_div - o5s_dispatch_table                # 20
-    .long op_mod - o5s_dispatch_table                # 21
-    .long op_neg - o5s_dispatch_table                # 22
-    .long op_bit_and - o5s_dispatch_table            # 23
-    .long op_bit_or - o5s_dispatch_table             # 24
-    .long op_bit_xor - o5s_dispatch_table            # 25
-    .long op_bit_not - o5s_dispatch_table            # 26
-    .long op_shl - o5s_dispatch_table                # 27
-    .long op_shr - o5s_dispatch_table                # 28
-    .long op_eq - o5s_dispatch_table                 # 29
-    .long op_ne - o5s_dispatch_table                 # 30
-    .long op_lt - o5s_dispatch_table                 # 31
-    .long op_le - o5s_dispatch_table                 # 32
-    .long op_gt - o5s_dispatch_table                 # 33
-    .long op_ge - o5s_dispatch_table                 # 34
-    .long op_lnot - o5s_dispatch_table               # 35
-    .long op_jmp - o5s_dispatch_table                # 36
-    .long op_jmp_if_zero - o5s_dispatch_table        # 37
-    .long op_jmp_if_nonzero - o5s_dispatch_table     # 38
-    .long op_call_builtin - o5s_dispatch_table       # 39
-    .long op_call - o5s_dispatch_table               # 40
-    .long op_ret - o5s_dispatch_table                # 41
-    .long op_halt - o5s_dispatch_table               # 42
-    .long op_loop_step - o5s_dispatch_table          # 43
-    .long op_add_local - o5s_dispatch_table          # 44
+    .long op_nop - o5s_dispatch_table
+    .long op_push_num - o5s_dispatch_table
+    .long op_push_0 - o5s_dispatch_table
+    .long op_push_1 - o5s_dispatch_table
+    .long op_push_str - o5s_dispatch_table
+    .long op_pop - o5s_dispatch_table
+    .long op_dup - o5s_dispatch_table
+    .long op_load_local - o5s_dispatch_table
+    .long op_store_local - o5s_dispatch_table
+    .long op_load_state - o5s_dispatch_table
+    .long op_store_state - o5s_dispatch_table
+    .long op_load_host - o5s_dispatch_table
+    .long op_check_bounds - o5s_dispatch_table
+    .long op_load_local_elem - o5s_dispatch_table
+    .long op_store_local_elem - o5s_dispatch_table
+    .long op_load_state_elem - o5s_dispatch_table
+    .long op_store_state_elem - o5s_dispatch_table
+    .long op_add - o5s_dispatch_table
+    .long op_sub - o5s_dispatch_table
+    .long op_mul - o5s_dispatch_table
+    .long op_div - o5s_dispatch_table
+    .long op_mod - o5s_dispatch_table
+    .long op_neg - o5s_dispatch_table
+    .long op_bit_and - o5s_dispatch_table
+    .long op_bit_or - o5s_dispatch_table
+    .long op_bit_xor - o5s_dispatch_table
+    .long op_bit_not - o5s_dispatch_table
+    .long op_shl - o5s_dispatch_table
+    .long op_shr - o5s_dispatch_table
+    .long op_eq - o5s_dispatch_table
+    .long op_ne - o5s_dispatch_table
+    .long op_lt - o5s_dispatch_table
+    .long op_le - o5s_dispatch_table
+    .long op_gt - o5s_dispatch_table
+    .long op_ge - o5s_dispatch_table
+    .long op_lnot - o5s_dispatch_table
+    .long op_jmp - o5s_dispatch_table
+    .long op_jmp_if_zero - o5s_dispatch_table
+    .long op_jmp_if_nonzero - o5s_dispatch_table
+    .long op_call_builtin - o5s_dispatch_table
+    .long op_call - o5s_dispatch_table
+    .long op_ret - o5s_dispatch_table
+    .long op_halt - o5s_dispatch_table
+    .long op_loop_step - o5s_dispatch_table
+    .long op_add_local - o5s_dispatch_table
