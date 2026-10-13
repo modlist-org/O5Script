@@ -577,7 +577,7 @@ pub const Compiler = struct {
         for (self.call_fixups[0..self.call_fixup_count]) |*cf| {
             if (std.mem.eql(u8, cf.func_name, name)) {
                 if (cf.arg_count != param_count) return error.ArgumentCountMismatch;
-                const packed_arg: i64 = @bitCast((@as(u64, @intCast(cf.frame_offset)) << 32) | @as(u64, @intCast(entry_ip)));
+                const packed_arg: i64 = @bitCast((@as(u64, @intCast(cf.frame_offset * 24)) << 32) | @as(u64, @intCast(entry_ip)));
                 self.ops[cf.op_idx].arg = packed_arg;
                 cf.func_name = "";
             }
@@ -590,7 +590,7 @@ pub const Compiler = struct {
         if (self.findFunc(name)) |fidx| {
             const func = self.funcs[fidx];
             if (func.param_count != arg_count) return error.ArgumentCountMismatch;
-            const packed_arg: i64 = @bitCast((@as(u64, @intCast(frame_offset)) << 32) | @as(u64, @intCast(func.entry_ip)));
+            const packed_arg: i64 = @bitCast((@as(u64, @intCast(frame_offset * 24)) << 32) | @as(u64, @intCast(func.entry_ip)));
             _ = try self.emit(.call, packed_arg);
         } else {
             if (self.call_fixup_count >= 64) return error.TooManyCalls;
@@ -1224,6 +1224,16 @@ pub const Compiler = struct {
             const is_local = self.findLocal(name);
             const is_state = self.findState(name);
 
+            if (op_tok == .plus_equal and is_local != null and self.cur.tag == .ident and (self.peek.tag == .semicolon or self.peek.tag == .r_brace)) {
+                if (self.findLocal(self.cur.text)) |src_slot| {
+                    self.advance();
+                    _ = self.match(.semicolon);
+                    const packed_arg: i64 = @bitCast(@as(u64, @intCast(is_local.?)) | (@as(u64, @intCast(src_slot)) << 16));
+                    _ = try self.emit(.add_local, packed_arg);
+                    return;
+                }
+            }
+
             if (op_tok != .equal) {
                 if (is_local) |slot| {
                     _ = try self.emit(.load_local, @intCast(slot));
@@ -1333,6 +1343,10 @@ pub const Compiler = struct {
             const idx_slot = if (idx_name) |n| (try self.addLocal(n)) else (try self.addLocal(""));
             const v_slot = try self.addLocal(v_name);
 
+            const limit_slot = try self.addLocal("");
+            _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(N))));
+            _ = try self.emit(.store_local, @intCast(limit_slot));
+
             _ = try self.emit(.push_0, 0);
             _ = try self.emit(.store_local, @intCast(idx_slot));
 
@@ -1341,9 +1355,11 @@ pub const Compiler = struct {
             self.loop_depth += 1;
 
             _ = try self.emit(.load_local, @intCast(idx_slot));
-            _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(N))));
+            _ = try self.emit(.load_local, @intCast(limit_slot));
             _ = try self.emit(.lt, 0);
             const exit_cond_jmp = try self.emit(.jmp_if_zero, 0);
+
+            const loop_body_ip = self.op_count;
 
             _ = try self.emit(.load_local, @intCast(idx_slot));
             if (arr.is_state) {
@@ -1361,12 +1377,12 @@ pub const Compiler = struct {
                 self.patchJump(cnt_jmp, continue_ip);
             }
 
-            _ = try self.emit(.load_local, @intCast(idx_slot));
-            _ = try self.emit(.push_1, 0);
-            _ = try self.emit(.add, 0);
-            _ = try self.emit(.store_local, @intCast(idx_slot));
-
-            _ = try self.emit(.jmp, @intCast(loop_start_ip));
+            const packed_arg: i64 = @bitCast(
+                @as(u64, @intCast(idx_slot)) |
+                (@as(u64, @intCast(limit_slot)) << 16) |
+                (@as(u64, @intCast(loop_body_ip)) << 32)
+            );
+            _ = try self.emit(.loop_step, packed_arg);
             const loop_end_ip = self.op_count;
             self.patchJump(exit_cond_jmp, loop_end_ip);
 
@@ -1419,9 +1435,11 @@ pub const Compiler = struct {
             exit_cond_jmp = try self.emit(.jmp_if_zero, 0);
         }
 
+        const loop_body_ip = self.op_count;
+
         try self.parseBlock();
 
-        const continue_ip = if (is_infinite) loop_start_ip else self.op_count;
+        const continue_ip = self.op_count;
         const current_loop = self.loops[self.loop_depth - 1];
         for (current_loop.continues[0..current_loop.continue_count]) |cnt_jmp| {
             self.patchJump(cnt_jmp, continue_ip);
@@ -1429,13 +1447,15 @@ pub const Compiler = struct {
 
         if (!is_infinite) {
             const vslot = loop_var_slot.?;
-            _ = try self.emit(.load_local, @intCast(vslot));
-            _ = try self.emit(.push_1, 0);
-            _ = try self.emit(.add, 0);
-            _ = try self.emit(.store_local, @intCast(vslot));
+            const packed_arg: i64 = @bitCast(
+                @as(u64, @intCast(vslot)) |
+                (@as(u64, @intCast(limit_slot)) << 16) |
+                (@as(u64, @intCast(loop_body_ip)) << 32)
+            );
+            _ = try self.emit(.loop_step, packed_arg);
+        } else {
+            _ = try self.emit(.jmp, @intCast(loop_start_ip));
         }
-
-        _ = try self.emit(.jmp, @intCast(loop_start_ip));
         const loop_end_ip = self.op_count;
 
         if (exit_cond_jmp) |j| {

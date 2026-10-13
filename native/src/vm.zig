@@ -107,11 +107,115 @@ fn appendNumber(scratch: []u8, pos: *usize, num: f64) !void {
     }
 }
 
+extern fn o5s_vm_exec_x86_64(
+    prog: *Prog,
+    entry_ip: usize,
+    host_vars: ?[*]const f64,
+    host_count: usize,
+    out_res: *O5Result,
+) callconv(.c) i32;
+
+threadlocal var asm_scratch_pos: usize = 0;
+
+export fn o5s_asm_str_add(l: *Value, r: *Value) void {
+    const scratch = &thread_scratch;
+    if (asm_scratch_pos + 1024 > scratch.len) {
+        asm_scratch_pos = 0;
+    }
+    const start_pos = asm_scratch_pos;
+    if (l.val_type == .str) {
+        appendString(scratch, &asm_scratch_pos, l.toSlice()) catch return;
+    } else {
+        appendNumber(scratch, &asm_scratch_pos, l.num) catch return;
+    }
+    if (r.val_type == .str) {
+        appendString(scratch, &asm_scratch_pos, r.toSlice()) catch return;
+    } else {
+        appendNumber(scratch, &asm_scratch_pos, r.num) catch return;
+    }
+    const len = asm_scratch_pos - start_pos;
+    if (len <= types.max_str_len) {
+        l.* = Value.fromStr(scratch[start_pos .. start_pos + len]);
+    }
+}
+
+export fn o5s_asm_builtin_call(packed_arg: i64, stack_top: [*]Value) usize {
+    const builtin_id: Builtin = @enumFromInt(@as(u8, @truncate(@as(u64, @bitCast(packed_arg)))));
+    const arity: u8 = @truncate(@as(u64, @bitCast(packed_arg)) >> 8);
+    if (arity == 1) {
+        const ptr = stack_top - 1;
+        const arg0 = ptr[0].num;
+        const res = switch (builtin_id) {
+            .sin => @sin(arg0),
+            .cos => @cos(arg0),
+            .tan => @tan(arg0),
+            .asin => math.asin(arg0),
+            .acos => math.acos(arg0),
+            .atan => math.atan(arg0),
+            .sqrt => @sqrt(arg0),
+            .abs => @abs(arg0),
+            .floor => @floor(arg0),
+            .ceil => @ceil(arg0),
+            .round => @round(arg0),
+            .log => @log(arg0),
+            .exp => @exp(arg0),
+            else => arg0,
+        };
+        ptr[0] = Value.fromNum(res);
+        return 0;
+    } else if (arity == 2) {
+        const ptr1 = stack_top - 1;
+        const ptr0 = stack_top - 2;
+        const arg1 = ptr1[0].num;
+        const arg0 = ptr0[0].num;
+        const res = switch (builtin_id) {
+            .atan2 => math.atan2(arg0, arg1),
+            .min => @min(arg0, arg1),
+            .max => @max(arg0, arg1),
+            .pow => math.pow(f64, arg0, arg1),
+            else => 0.0,
+        };
+        ptr0[0] = Value.fromNum(res);
+        return 24;
+    } else if (arity == 3) {
+        const ptr2 = stack_top - 1;
+        const ptr1 = stack_top - 2;
+        const ptr0 = stack_top - 3;
+        const arg2 = ptr2[0].num;
+        const arg1 = ptr1[0].num;
+        const arg0 = ptr0[0].num;
+        const res = switch (builtin_id) {
+            .clamp => math.clamp(arg0, arg1, arg2),
+            .lerp => math.lerp(arg0, arg1, arg2),
+            else => 0.0,
+        };
+        ptr0[0] = Value.fromNum(res);
+        return 48;
+    }
+    return 0;
+}
+
 pub fn run(
     prog: *Prog,
     entry_ip: usize,
     host_vars: []const f64,
 ) EvalError!Value {
+    if (@import("builtin").cpu.arch == .x86_64 and @import("builtin").os.tag == .linux) {
+        var res: O5Result = .{};
+        const vars_ptr = if (host_vars.len > 0) host_vars.ptr else null;
+        const ret_code = o5s_vm_exec_x86_64(prog, entry_ip, vars_ptr, host_vars.len, &res);
+        if (ret_code == 0) {
+            return Value{
+                .num = res.num,
+                .str_ptr = res.str_ptr,
+                .str_len = res.str_len,
+                .val_type = @enumFromInt(res.val_type),
+            };
+        } else if (ret_code == -6) {
+            return EvalError.OutOfBounds;
+        }
+    }
+
     const scratch = &thread_scratch;
     var scratch_pos: usize = 0;
 
@@ -552,7 +656,7 @@ pub fn run(
             .call => {
                 if (csp >= max_calls) return EvalError.CallStackOverflow;
                 const target_ip: usize = @intCast(@as(u32, @truncate(@as(u64, @bitCast(op.arg)))));
-                const frame_shift: usize = @intCast(@as(u32, @truncate(@as(u64, @bitCast(op.arg)) >> 32)));
+                const frame_shift: usize = @intCast(@as(u32, @truncate(@as(u64, @bitCast(op.arg)) >> 32)) / 24);
                 if (fp + frame_shift >= max_locals) return EvalError.StackOverflow;
                 call_stack[csp] = .{ .ret_ip = ip, .prev_fp = fp };
                 csp += 1;
@@ -568,6 +672,26 @@ pub fn run(
                 } else {
                     break;
                 }
+            },
+
+            .loop_step => {
+                const packed_u: u64 = @bitCast(op.arg);
+                const vslot: usize = @intCast(@as(u16, @truncate(packed_u)));
+                const limit_slot: usize = @intCast(@as(u16, @truncate(packed_u >> 16)));
+                const target_ip: usize = @intCast(@as(u32, @truncate(packed_u >> 32)));
+
+                const new_val = locals[fp + vslot].num + 1.0;
+                locals[fp + vslot].num = new_val;
+                if (new_val < locals[fp + limit_slot].num) {
+                    ip = target_ip;
+                }
+            },
+
+            .add_local => {
+                const packed_u: u64 = @bitCast(op.arg);
+                const dest_slot: usize = @intCast(@as(u16, @truncate(packed_u)));
+                const src_slot: usize = @intCast(@as(u16, @truncate(packed_u >> 16)));
+                locals[fp + dest_slot].num += locals[fp + src_slot].num;
             },
 
             .halt => {

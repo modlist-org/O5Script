@@ -9,7 +9,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = true,
     });
+    mod.addAssemblyFile(b.path("src/vm_x86_64.S"));
 
     const lib = b.addLibrary(.{
         .name = "o5script",
@@ -23,7 +25,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = true,
     });
+    exe_mod.addAssemblyFile(b.path("src/vm_x86_64.S"));
     const exe = b.addExecutable(.{
         .name = "o5s",
         .root_module = exe_mod,
@@ -37,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    test_mod.addAssemblyFile(b.path("src/vm_x86_64.S"));
     const unit_tests = b.addTest(.{
         .name = "o5script-test",
         .root_module = test_mod,
