@@ -555,6 +555,150 @@ test "in-place increment and decrement" {
     try std.testing.expectEqual(@as(f64, 11.0), res.num);
 }
 
+test "struct definition and basic access" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Vec2 {
+        \\    x: num,
+        \\    y: num,
+        \\}
+        \\let p: Vec2 = Vec2 { x: 10, y: 20 };
+        \\p.x + p.y
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 30.0), res.num);
+}
+
+test "struct instantiation forms" {
+    const allocator = std.testing.allocator;
+    // Test positional, array style, default zero, inferred type
+    const src =
+        \\stu Vec2 {
+        \\    x: num,
+        \\    y: num,
+        \\}
+        \\let a = Vec2 { 3, 4 };
+        \\let b: Vec2 = [5, 6];
+        \\let c: Vec2;
+        \\a.x + a.y + b.x + b.y + c.x + c.y
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 3 + 4 + 5 + 6 + 0 + 0 = 18
+    try std.testing.expectEqual(@as(f64, 18.0), res.num);
+}
+
+test "struct mutation and inc_local optimization" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Vec2 {
+        \\    x: num,
+        \\    y: num,
+        \\}
+        \\let p: Vec2 = Vec2 { x: 10, y: 20 };
+        \\p.x += 1;
+        \\p.x += 1;
+        \\p.x -= 1;
+        \\p.y *= 2;
+        \\p.x + p.y
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    var has_inc = false;
+    var has_dec = false;
+    for (prog.ops) |op| {
+        if (op.code == .inc_local) has_inc = true;
+        if (op.code == .dec_local) has_dec = true;
+    }
+    try std.testing.expect(has_inc);
+    try std.testing.expect(has_dec);
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // p.x: 10 + 1 + 1 - 1 = 11; p.y: 20 * 2 = 40; sum = 51
+    try std.testing.expectEqual(@as(f64, 51.0), res.num);
+}
+
+test "struct copy assignment" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Vec2 {
+        \\    x: num,
+        \\    y: num,
+        \\}
+        \\let a = Vec2 { x: 100, y: 200 };
+        \\let b: Vec2 = a;
+        \\b.x += 5;
+        \\b.x + b.y + a.x
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // b.x = 105, b.y = 200, a.x = 100 => 405
+    try std.testing.expectEqual(@as(f64, 405.0), res.num);
+}
+
+test "state struct persistence" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Counter {
+        \\    val: num,
+        \\    step: num,
+        \\}
+        \\sta c: Counter = Counter { val: 0, step: 2 };
+        \\c.val += c.step;
+        \\c.val
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    var res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 2.0), res.num);
+
+    res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 4.0), res.num);
+}
+
+test "struct loop performance pattern" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Particle {
+        \\    x: num,
+        \\    v: num,
+        \\}
+        \\let p = Particle { x: 0, v: 3 };
+        \\lop 1000 {
+        \\    p.x += p.v;
+        \\}
+        \\p.x
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 3000.0), res.num);
+}
+
+test "struct compile-time type errors" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UnknownType, compiler.compileSource("let p: NonExistent;", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource(
+        \\stu Vec2 { x: num, y: num }
+        \\let p: Vec2 = Vec2 { x: "hello", y: 2 };
+    , allocator));
+    try std.testing.expectError(error.UndefinedVariable, compiler.compileSource(
+        \\stu Vec2 { x: num, y: num }
+        \\let p = Vec2 { x: 1, y: 2 };
+        \\p.z = 10;
+    , allocator));
+}
+
 
 
 

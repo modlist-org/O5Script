@@ -79,6 +79,7 @@ pub const TokenType = enum {
     kw_tag,
     kw_tru,
     kw_fls,
+    kw_stu,
 
     plus,
     minus,
@@ -241,6 +242,7 @@ pub const Lexer = struct {
                 else if (std.mem.eql(u8, ident, "tag")) TokenType.kw_tag
                 else if (std.mem.eql(u8, ident, "tru")) TokenType.kw_tru
                 else if (std.mem.eql(u8, ident, "fls")) TokenType.kw_fls
+                else if (std.mem.eql(u8, ident, "stu")) TokenType.kw_stu
                 else TokenType.ident;
             return .{ .tag = kw, .text = ident };
         }
@@ -381,6 +383,10 @@ pub const Compiler = struct {
     loop_depth: usize = 0,
     arrays: [64]ArrayVar = undefined,
     array_count: usize = 0,
+    struct_defs: [16]StructDef = undefined,
+    struct_def_count: usize = 0,
+    struct_vars: [32]StructVar = undefined,
+    struct_var_count: usize = 0,
 
     call_fixups: [64]CallFixup = undefined,
     call_fixup_count: usize = 0,
@@ -416,9 +422,46 @@ pub const Compiler = struct {
         }
     };
 
+    pub const StructField = struct {
+        name: []const u8,
+        offset: usize,
+        data_type: DataType,
+    };
+
+    pub const StructDef = struct {
+        name: []const u8,
+        fields: [16]StructField = undefined,
+        field_count: usize = 0,
+
+        pub fn addField(self: *StructDef, name: []const u8, dt: DataType) CompileError!void {
+            if (self.field_count >= 16) return error.TooManyLocals;
+            self.fields[self.field_count] = .{
+                .name = name,
+                .offset = self.field_count,
+                .data_type = dt,
+            };
+            self.field_count += 1;
+        }
+
+        pub fn findField(self: StructDef, name: []const u8) ?StructField {
+            for (self.fields[0..self.field_count]) |f| {
+                if (std.mem.eql(u8, f.name, name)) return f;
+            }
+            return null;
+        }
+    };
+
+    pub const StructVar = struct {
+        name: []const u8,
+        struct_name: []const u8,
+        base_slot: usize,
+        is_state: bool = false,
+    };
+
     pub const TypeAnnotation = struct {
         data_type: DataType = .unknown,
         array: ?ArrayInfo = null,
+        struct_name: ?[]const u8 = null,
     };
 
     pub const ArrayVar = struct {
@@ -444,6 +487,8 @@ pub const Compiler = struct {
             .allocator = allocator,
             .module_count = 0,
             .array_count = 0,
+            .struct_def_count = 0,
+            .struct_var_count = 0,
             .local_count = 0,
             .state_count = 0,
             .host_tag_count = 0,
@@ -598,6 +643,39 @@ pub const Compiler = struct {
         if (self.array_count >= 64) return error.TooManyLocals;
         self.arrays[self.array_count] = .{ .name = name, .info = info };
         self.array_count += 1;
+    }
+
+    fn findStructDef(self: *Compiler, name: []const u8) ?StructDef {
+        for (self.struct_defs[0..self.struct_def_count]) |d| {
+            if (std.mem.eql(u8, d.name, name)) return d;
+        }
+        return null;
+    }
+
+    fn addStructDef(self: *Compiler, def: StructDef) CompileError!void {
+        if (self.struct_def_count >= 16) return error.TooManyLocals;
+        self.struct_defs[self.struct_def_count] = def;
+        self.struct_def_count += 1;
+    }
+
+    fn findStructVar(self: *Compiler, name: []const u8) ?StructVar {
+        var i = self.struct_var_count;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.struct_vars[i].name, name)) return self.struct_vars[i];
+        }
+        return null;
+    }
+
+    fn addStructVar(self: *Compiler, name: []const u8, struct_name: []const u8, base_slot: usize, is_state: bool) CompileError!void {
+        if (self.struct_var_count >= 32) return error.TooManyLocals;
+        self.struct_vars[self.struct_var_count] = .{
+            .name = name,
+            .struct_name = struct_name,
+            .base_slot = base_slot,
+            .is_state = is_state,
+        };
+        self.struct_var_count += 1;
     }
 
     fn findFunc(self: *Compiler, name: []const u8) ?usize {
@@ -919,6 +997,7 @@ pub const Compiler = struct {
             info.dim_count += 1;
         }
         var dt: DataType = .unknown;
+        var sname_annot: ?[]const u8 = null;
         if (self.cur.tag == .ident) {
             const tname = self.cur.text;
             self.advance();
@@ -926,6 +1005,8 @@ pub const Compiler = struct {
                 dt = .num;
             } else if (std.mem.eql(u8, tname, "str")) {
                 dt = .str;
+            } else if (self.findStructDef(tname) != null) {
+                sname_annot = tname;
             } else {
                 return error.UnknownType;
             }
@@ -933,15 +1014,16 @@ pub const Compiler = struct {
             return error.SyntaxError;
         }
         if (has_array) {
+            if (sname_annot != null) return error.UnknownType;
             var total: u32 = 1;
             for (info.dims[0..info.dim_count]) |d| {
                 total *= d;
             }
             info.total_elements = total;
             info.elem_type = dt;
-            return TypeAnnotation{ .data_type = dt, .array = info };
+            return TypeAnnotation{ .data_type = dt, .array = info, .struct_name = null };
         }
-        return TypeAnnotation{ .data_type = dt, .array = null };
+        return TypeAnnotation{ .data_type = dt, .array = null, .struct_name = sname_annot };
     }
 
     fn skipTypeAnnotation(self: *Compiler) CompileError!void {
@@ -1095,12 +1177,250 @@ pub const Compiler = struct {
         }
     }
 
+    fn parseStructDef(self: *Compiler) CompileError!void {
+        _ = self.match(.kw_stu);
+        if (self.cur.tag != .ident) return error.SyntaxError;
+        const sname = self.cur.text;
+        self.advance();
+        if (!self.match(.l_brace)) return error.SyntaxError;
+
+        var def = StructDef{ .name = sname };
+        while (self.cur.tag != .r_brace and self.cur.tag != .eof) {
+            if (self.cur.tag != .ident) return error.SyntaxError;
+            const fname = self.cur.text;
+            self.advance();
+            if (!self.match(.colon)) return error.SyntaxError;
+            if (self.cur.tag != .ident) return error.SyntaxError;
+            const tname = self.cur.text;
+            self.advance();
+            var dt: DataType = .unknown;
+            if (std.mem.eql(u8, tname, "num")) {
+                dt = .num;
+            } else if (std.mem.eql(u8, tname, "str")) {
+                dt = .str;
+            } else {
+                return error.UnknownType;
+            }
+            try def.addField(fname, dt);
+            _ = self.match(.comma);
+            _ = self.match(.semicolon);
+        }
+        if (!self.match(.r_brace)) return error.SyntaxError;
+        _ = self.match(.semicolon);
+        try self.addStructDef(def);
+    }
+
+    fn parseStructInit(self: *Compiler, sdef: StructDef, base_slot: usize, is_state: bool, is_decl: bool) CompileError!void {
+        if (self.cur.tag == .ident and std.mem.eql(u8, self.cur.text, sdef.name)) {
+            self.advance();
+        }
+
+        if (self.cur.tag == .ident and self.peek.tag != .l_brace) {
+            const src_name = self.cur.text;
+            if (self.findStructVar(src_name)) |src| {
+                if (!std.mem.eql(u8, src.struct_name, sdef.name)) return error.TypeMismatch;
+                self.advance();
+                for (0..sdef.field_count) |fi| {
+                    const src_slot = src.base_slot + fi;
+                    const dst_slot = base_slot + fi;
+                    if (src.is_state) {
+                        _ = try self.emit(.load_state, @intCast(src_slot));
+                    } else {
+                        _ = try self.emit(.load_local, @intCast(src_slot));
+                    }
+                    if (is_state) {
+                        _ = try self.emit(.store_state, @intCast(dst_slot));
+                    } else {
+                        _ = try self.emit(.store_local, @intCast(dst_slot));
+                    }
+                }
+                return;
+            }
+        }
+
+        if (self.match(.l_brace)) {
+            var initialized: [16]bool = @splat(false);
+            var idx: usize = 0;
+            while (self.cur.tag != .r_brace and self.cur.tag != .eof) {
+                if (self.cur.tag == .ident and self.peek.tag == .colon) {
+                    const fname = self.cur.text;
+                    self.advance();
+                    self.advance();
+                    const field = sdef.findField(fname) orelse return error.SyntaxError;
+                    const slot = base_slot + field.offset;
+                    if (is_decl and is_state) {
+                        var val: f64 = 0.0;
+                        if (self.cur.tag == .number) {
+                            val = self.cur.num_val;
+                            self.advance();
+                        } else if (self.match(.minus) and self.cur.tag == .number) {
+                            val = -self.cur.num_val;
+                            self.advance();
+                        } else {
+                            return error.SyntaxError;
+                        }
+                        self.state_inits[slot] = Value.fromNum(val);
+                        initialized[field.offset] = true;
+                    } else {
+                        try self.parseExpression();
+                        if (field.data_type != .unknown and self.last_expr_type != .unknown and field.data_type != self.last_expr_type) {
+                            return error.TypeMismatch;
+                        }
+                        if (is_state) {
+                            _ = try self.emit(.store_state, @intCast(slot));
+                        } else {
+                            _ = try self.emit(.store_local, @intCast(slot));
+                        }
+                        initialized[field.offset] = true;
+                    }
+                } else {
+                    if (idx >= sdef.field_count) return error.SyntaxError;
+                    const field = sdef.fields[idx];
+                    const slot = base_slot + field.offset;
+                    if (is_decl and is_state) {
+                        var val: f64 = 0.0;
+                        if (self.cur.tag == .number) {
+                            val = self.cur.num_val;
+                            self.advance();
+                        } else if (self.match(.minus) and self.cur.tag == .number) {
+                            val = -self.cur.num_val;
+                            self.advance();
+                        } else {
+                            return error.SyntaxError;
+                        }
+                        self.state_inits[slot] = Value.fromNum(val);
+                        initialized[field.offset] = true;
+                        idx += 1;
+                    } else {
+                        try self.parseExpression();
+                        if (field.data_type != .unknown and self.last_expr_type != .unknown and field.data_type != self.last_expr_type) {
+                            return error.TypeMismatch;
+                        }
+                        if (is_state) {
+                            _ = try self.emit(.store_state, @intCast(slot));
+                        } else {
+                            _ = try self.emit(.store_local, @intCast(slot));
+                        }
+                        initialized[field.offset] = true;
+                        idx += 1;
+                    }
+                }
+                _ = self.match(.comma);
+            }
+            if (!self.match(.r_brace)) return error.SyntaxError;
+
+            if (!is_decl or !is_state) {
+                for (0..sdef.field_count) |fi| {
+                    if (!initialized[fi]) {
+                        const slot = base_slot + fi;
+                        _ = try self.emit(.push_0, 0);
+                        if (is_state) {
+                            _ = try self.emit(.store_state, @intCast(slot));
+                        } else {
+                            _ = try self.emit(.store_local, @intCast(slot));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if (self.match(.l_bracket)) {
+            for (0..sdef.field_count) |fi| {
+                if (self.cur.tag == .r_bracket or self.cur.tag == .eof) {
+                    if (!is_decl or !is_state) {
+                        const slot = base_slot + fi;
+                        _ = try self.emit(.push_0, 0);
+                        if (is_state) {
+                            _ = try self.emit(.store_state, @intCast(slot));
+                        } else {
+                            _ = try self.emit(.store_local, @intCast(slot));
+                        }
+                    }
+                } else {
+                    const field = sdef.fields[fi];
+                    const slot = base_slot + field.offset;
+                    if (is_decl and is_state) {
+                        var val: f64 = 0.0;
+                        if (self.cur.tag == .number) {
+                            val = self.cur.num_val;
+                            self.advance();
+                        } else if (self.match(.minus) and self.cur.tag == .number) {
+                            val = -self.cur.num_val;
+                            self.advance();
+                        } else {
+                            return error.SyntaxError;
+                        }
+                        self.state_inits[slot] = Value.fromNum(val);
+                        _ = self.match(.comma);
+                    } else {
+                        try self.parseExpression();
+                        if (field.data_type != .unknown and self.last_expr_type != .unknown and field.data_type != self.last_expr_type) {
+                            return error.TypeMismatch;
+                        }
+                        if (is_state) {
+                            _ = try self.emit(.store_state, @intCast(slot));
+                        } else {
+                            _ = try self.emit(.store_local, @intCast(slot));
+                        }
+                        _ = self.match(.comma);
+                    }
+                }
+            }
+            if (!self.match(.r_bracket)) return error.SyntaxError;
+            return;
+        }
+
+        return error.SyntaxError;
+    }
+
     fn parseStatement(self: *Compiler) CompileError!void {
+        if (self.match(.kw_stu)) {
+            try self.parseStructDef();
+            return;
+        }
+
         if (self.match(.kw_let)) {
             const name = self.cur.text;
             self.advance();
             const annot = try self.parseTypeAnnotation();
+            if (annot) |a| {
+                if (a.struct_name) |sname| {
+                    const sdef = self.findStructDef(sname) orelse return error.UnknownType;
+                    const base_slot = self.local_count;
+                    for (0..sdef.field_count) |fi| {
+                        const s = try self.addLocal("");
+                        self.local_types[s] = sdef.fields[fi].data_type;
+                    }
+                    try self.addStructVar(name, sname, base_slot, false);
+
+                    if (self.match(.equal)) {
+                        try self.parseStructInit(sdef, base_slot, false, true);
+                    } else {
+                        for (0..sdef.field_count) |fi| {
+                            const slot = base_slot + fi;
+                            _ = try self.emit(.push_0, 0);
+                            _ = try self.emit(.store_local, @intCast(slot));
+                        }
+                    }
+                    _ = self.match(.semicolon);
+                    return;
+                }
+            }
             if (self.match(.equal)) {
+                if (self.cur.tag == .ident and self.findStructDef(self.cur.text) != null and self.peek.tag == .l_brace) {
+                    const sname = self.cur.text;
+                    const sdef = self.findStructDef(sname).?;
+                    const base_slot = self.local_count;
+                    for (0..sdef.field_count) |fi| {
+                        const s = try self.addLocal("");
+                        self.local_types[s] = sdef.fields[fi].data_type;
+                    }
+                    try self.addStructVar(name, sname, base_slot, false);
+                    try self.parseStructInit(sdef, base_slot, false, true);
+                    _ = self.match(.semicolon);
+                    return;
+                }
                 if (self.cur.tag == .l_bracket) {
                     var arr_info = if (annot) |a| (a.array orelse ArrayInfo{}) else ArrayInfo{};
                     if (annot) |a| arr_info.elem_type = a.data_type;
@@ -1146,7 +1466,37 @@ pub const Compiler = struct {
             const name = self.cur.text;
             self.advance();
             const annot = try self.parseTypeAnnotation();
+            if (annot) |a| {
+                if (a.struct_name) |sname| {
+                    const sdef = self.findStructDef(sname) orelse return error.UnknownType;
+                    const base_slot = self.state_count;
+                    for (0..sdef.field_count) |fi| {
+                        const s = try self.addState("");
+                        self.state_types[s] = sdef.fields[fi].data_type;
+                    }
+                    try self.addStructVar(name, sname, base_slot, true);
+
+                    if (self.match(.equal)) {
+                        try self.parseStructInit(sdef, base_slot, true, true);
+                    }
+                    _ = self.match(.semicolon);
+                    return;
+                }
+            }
             if (self.match(.equal)) {
+                if (self.cur.tag == .ident and self.findStructDef(self.cur.text) != null and self.peek.tag == .l_brace) {
+                    const sname = self.cur.text;
+                    const sdef = self.findStructDef(sname).?;
+                    const base_slot = self.state_count;
+                    for (0..sdef.field_count) |fi| {
+                        const s = try self.addState("");
+                        self.state_types[s] = sdef.fields[fi].data_type;
+                    }
+                    try self.addStructVar(name, sname, base_slot, true);
+                    try self.parseStructInit(sdef, base_slot, true, true);
+                    _ = self.match(.semicolon);
+                    return;
+                }
                 if (self.cur.tag == .l_bracket) {
                     var arr_info = if (annot) |a| (a.array orelse ArrayInfo{}) else ArrayInfo{};
                     if (annot) |a| arr_info.elem_type = a.data_type;
@@ -1368,6 +1718,7 @@ pub const Compiler = struct {
             const saved_local_count = self.local_count;
             self.local_count = 0;
             const saved_arrays = self.array_count;
+            const saved_struct_vars = self.struct_var_count;
 
             var p = param_count;
             while (p > 0) {
@@ -1396,6 +1747,7 @@ pub const Compiler = struct {
 
             self.current_func_ret_type = saved_func_ret_type;
             self.array_count = saved_arrays;
+            self.struct_var_count = saved_struct_vars;
             self.locals = saved_locals;
             self.local_types = saved_local_types;
             self.local_consts = saved_local_consts;
@@ -1497,6 +1849,120 @@ pub const Compiler = struct {
             }
         }
 
+        if (self.cur.tag == .ident and self.peek.tag == .dot and self.findStructVar(self.cur.text) != null) {
+            const saved_pos = self.lexer.pos;
+            const saved_cur = self.cur;
+            const saved_peek = self.peek;
+            const saved_op_count = self.op_count;
+
+            const name = self.cur.text;
+            const svar = self.findStructVar(name).?;
+            const sdef = self.findStructDef(svar.struct_name) orelse return error.SyntaxError;
+            self.advance();
+            self.advance();
+            if (self.cur.tag != .ident) return error.SyntaxError;
+            const fname = self.cur.text;
+            self.advance();
+            const field = sdef.findField(fname) orelse return error.UndefinedVariable;
+            const slot = svar.base_slot + field.offset;
+
+            const op_tok = self.cur.tag;
+            if (op_tok != .equal and op_tok != .plus_equal and op_tok != .minus_equal and op_tok != .star_equal and op_tok != .slash_equal) {
+                self.lexer.pos = saved_pos;
+                self.cur = saved_cur;
+                self.peek = saved_peek;
+                self.op_count = saved_op_count;
+            } else {
+                self.advance();
+
+            if (!svar.is_state) {
+                if (op_tok == .plus_equal and self.cur.tag == .number and self.cur.num_val == 1.0 and (self.peek.tag == .semicolon or self.peek.tag == .r_brace)) {
+                    if (field.data_type == .str) return error.TypeMismatch;
+                    self.advance();
+                    _ = self.match(.semicolon);
+                    _ = try self.emit(.inc_local, @intCast(slot));
+                    return;
+                }
+                if (op_tok == .minus_equal and self.cur.tag == .number and self.cur.num_val == 1.0 and (self.peek.tag == .semicolon or self.peek.tag == .r_brace)) {
+                    if (field.data_type == .str) return error.TypeMismatch;
+                    self.advance();
+                    _ = self.match(.semicolon);
+                    _ = try self.emit(.dec_local, @intCast(slot));
+                    return;
+                }
+                if (op_tok == .plus_equal and self.cur.tag == .ident) {
+                    var src_slot_opt: ?usize = null;
+                    if (self.peek.tag == .dot) {
+                        if (self.findStructVar(self.cur.text)) |rhs_svar| {
+                            if (!rhs_svar.is_state) {
+                                const rhs_sdef = self.findStructDef(rhs_svar.struct_name).?;
+                                self.advance();
+                                self.advance();
+                                if (self.cur.tag == .ident) {
+                                    if (rhs_sdef.findField(self.cur.text)) |rhs_f| {
+                                        src_slot_opt = rhs_svar.base_slot + rhs_f.offset;
+                                    }
+                                }
+                            }
+                        }
+                    } else if (self.peek.tag == .semicolon or self.peek.tag == .r_brace) {
+                        src_slot_opt = self.findLocal(self.cur.text);
+                    }
+
+                    if (src_slot_opt) |src_slot| {
+                        if (self.local_types[slot] != .unknown and self.local_types[src_slot] != .unknown and self.local_types[slot] != self.local_types[src_slot]) {
+                            return error.TypeMismatch;
+                        }
+                        self.advance();
+                        _ = self.match(.semicolon);
+                        const packed_arg: i64 = @bitCast(@as(u64, @intCast(slot)) | (@as(u64, @intCast(src_slot)) << 16));
+                        _ = try self.emit(.add_local, packed_arg);
+                        return;
+                    }
+                }
+            }
+
+            if (op_tok != .equal) {
+                if (svar.is_state) {
+                    _ = try self.emit(.load_state, @intCast(slot));
+                } else {
+                    _ = try self.emit(.load_local, @intCast(slot));
+                }
+            }
+
+            try self.parseExpression();
+            if (field.data_type != .unknown and self.last_expr_type != .unknown and field.data_type != self.last_expr_type) {
+                return error.TypeMismatch;
+            }
+
+            switch (op_tok) {
+                .plus_equal => _ = try self.emit(.add, 0),
+                .minus_equal => _ = try self.emit(.sub, 0),
+                .star_equal => _ = try self.emit(.mul, 0),
+                .slash_equal => _ = try self.emit(.div, 0),
+                else => {},
+            }
+
+            if (svar.is_state) {
+                _ = try self.emit(.store_state, @intCast(slot));
+            } else {
+                _ = try self.emit(.store_local, @intCast(slot));
+            }
+            _ = self.match(.semicolon);
+            return;
+            }
+        }
+
+        if (self.cur.tag == .ident and self.peek.tag == .equal and self.findStructVar(self.cur.text) != null) {
+            const dst = self.findStructVar(self.cur.text).?;
+            const sdef = self.findStructDef(dst.struct_name) orelse return error.SyntaxError;
+            self.advance();
+            self.advance();
+            try self.parseStructInit(sdef, dst.base_slot, dst.is_state, false);
+            _ = self.match(.semicolon);
+            return;
+        }
+
         if (self.cur.tag == .ident and (self.peek.tag == .equal or self.peek.tag == .plus_equal or self.peek.tag == .minus_equal or self.peek.tag == .star_equal or self.peek.tag == .slash_equal)) {
             const name = self.cur.text;
             self.advance();
@@ -1593,6 +2059,7 @@ pub const Compiler = struct {
     fn parseBlock(self: *Compiler) CompileError!void {
         _ = self.match(.l_brace);
         const saved_locals = self.local_count;
+        const saved_struct_vars = self.struct_var_count;
 
         var had_expr = false;
         while (self.cur.tag != .r_brace and self.cur.tag != .eof) {
@@ -1605,6 +2072,7 @@ pub const Compiler = struct {
             _ = try self.emit(.push_0, 0);
         }
         self.local_count = saved_locals;
+        self.struct_var_count = saved_struct_vars;
     }
 
     fn parseIfStatement(self: *Compiler) CompileError!void {
@@ -2067,6 +2535,26 @@ pub const Compiler = struct {
 
         if (self.cur.tag == .ident) {
             const name = self.cur.text;
+
+            if (self.findStructVar(name)) |svar| {
+                if (self.peek.tag == .dot) {
+                    self.advance();
+                    self.advance();
+                    if (self.cur.tag != .ident) return error.SyntaxError;
+                    const fname = self.cur.text;
+                    self.advance();
+                    const sdef = self.findStructDef(svar.struct_name) orelse return error.SyntaxError;
+                    const field = sdef.findField(fname) orelse return error.UndefinedVariable;
+                    const slot = svar.base_slot + field.offset;
+                    self.last_expr_type = field.data_type;
+                    if (svar.is_state) {
+                        _ = try self.emit(.load_state, @intCast(slot));
+                    } else {
+                        _ = try self.emit(.load_local, @intCast(slot));
+                    }
+                    return;
+                }
+            }
 
             if (self.findArray(name)) |arr| {
                 if (self.peek.tag == .dot) {
