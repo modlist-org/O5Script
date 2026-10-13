@@ -113,11 +113,11 @@ extern fn o5s_vm_exec_x86_64(
     host_vars: ?[*]const f64,
     host_count: usize,
     out_res: *O5Result,
-) callconv(.c) i32;
+) callconv(.{ .x86_64_sysv = .{} }) i32;
 
 threadlocal var asm_scratch_pos: usize = 0;
 
-export fn o5s_asm_str_add(l: *Value, r: *Value) void {
+export fn o5s_asm_str_add(l: *Value, r: *Value) callconv(.{ .x86_64_sysv = .{} }) void {
     const scratch = &thread_scratch;
     if (asm_scratch_pos + 1024 > scratch.len) {
         asm_scratch_pos = 0;
@@ -139,7 +139,7 @@ export fn o5s_asm_str_add(l: *Value, r: *Value) void {
     }
 }
 
-export fn o5s_asm_builtin_call(packed_arg: i64, stack_top: [*]Value) usize {
+export fn o5s_asm_builtin_call(packed_arg: i64, stack_top: [*]Value) callconv(.{ .x86_64_sysv = .{} }) usize {
     const builtin_id: Builtin = @enumFromInt(@as(u8, @truncate(@as(u64, @bitCast(packed_arg)))));
     const arity: u8 = @truncate(@as(u64, @bitCast(packed_arg)) >> 8);
     if (arity == 1) {

@@ -1,10 +1,40 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compiler = @import("compiler.zig");
 const vm = @import("vm.zig");
 
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
+
+extern "c" fn _open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+extern "c" fn _read(fd: c_int, buf: [*]u8, count: c_uint) c_int;
+extern "c" fn _close(fd: c_int) c_int;
+
+fn c_open(path: [*:0]const u8) c_int {
+    if (builtin.os.tag == .windows) {
+        return _open(path, 0, 0);
+    } else {
+        return open(path, 0, 0);
+    }
+}
+
+fn c_read(fd: c_int, buf: [*]u8, count: usize) isize {
+    if (builtin.os.tag == .windows) {
+        const n = _read(fd, buf, @intCast(count));
+        return @intCast(n);
+    } else {
+        return read(fd, buf, count);
+    }
+}
+
+fn c_close(fd: c_int) void {
+    if (builtin.os.tag == .windows) {
+        _ = _close(fd);
+    } else {
+        _ = close(fd);
+    }
+}
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
     var path_buf: [1024]u8 = undefined;
@@ -13,12 +43,12 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
     path_buf[path.len] = 0;
     const path_z: [*:0]const u8 = path_buf[0..path.len :0];
 
-    const fd = open(path_z, 0, 0);
+    const fd = c_open(path_z);
     if (fd < 0) return null;
-    defer _ = close(fd);
+    defer c_close(fd);
 
     var buf = allocator.alloc(u8, 65536) catch return null;
-    const n = read(fd, buf.ptr, buf.len);
+    const n = c_read(fd, buf.ptr, buf.len);
     if (n <= 0) {
         allocator.free(buf);
         return null;
@@ -41,7 +71,9 @@ fn printResult(res: vm.Value) void {
 pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = std.heap.c_allocator;
 
-    var it = init.args.iterate();
+    var it = try std.process.Args.Iterator.initAllocator(init.args, allocator);
+    defer it.deinit();
+
     _ = it.next();
 
     const first_arg = it.next();
@@ -89,7 +121,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     while (true) {
         std.debug.print("o5s> ", .{});
-        const n = read(0, buf[0..].ptr, buf.len);
+        const n = c_read(0, buf[0..].ptr, buf.len);
         if (n <= 0) break;
         const line = buf[0..@intCast(n)];
         const trimmed = std.mem.trim(u8, line, " \t\r\n");

@@ -18,7 +18,9 @@
 .endm
 
 .globl o5s_vm_exec_x86_64
+#if !defined(_WIN32)
 .type o5s_vm_exec_x86_64, @function
+#endif
 o5s_vm_exec_x86_64:
     # SysV ABI: rdi=Prog, rsi=entry IP, rdx=host vars, rcx=count, r8=result.
     push rbp
@@ -368,7 +370,13 @@ op_mod:
     movsd xmm0, [r11 + r10 - 24]
     movsd xmm1, [r11 + r10]
     mov [rbp - 72], r10
+#if defined(_WIN32)
+    sub rsp, 40
     call fmod
+    add rsp, 40
+#else
+    call fmod
+#endif
     mov r10, [rbp - 72]
     lea r11, [rsp + 32768]
     lea r9, [rip + o5s_dispatch_table]
