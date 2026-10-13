@@ -1065,3 +1065,127 @@ test "dense jump table dispatch table_jmp" {
     // 300 + 100 + (-1) = 399
     try std.testing.expectEqual(@as(f64, 399.0), res.num);
 }
+
+test "jmp inclusive and half-open ranges" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun test_ranges(x: num): num {
+        \\    ret jmp x {
+        \\        0..1 => 10,
+        \\        1 => 20,
+        \\        2..=5 => 30,
+        \\        _ => 40
+        \\    };
+        \\}
+        \\test_ranges(0) + test_ranges(1) + test_ranges(3) + test_ranges(5) + test_ranges(6)
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 10 + 20 + 30 + 30 + 40 = 130
+    try std.testing.expectEqual(@as(f64, 130.0), res.num);
+}
+
+test "lop inclusive range 0..=10 vs half-open 0..10" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let s1 = 0;
+        \\lop |i| 0..10 {
+        \\    s1 += i;
+        \\}
+        \\let s2 = 0;
+        \\lop |i| 0..=10 {
+        \\    s2 += i;
+        \\}
+        \\s1 * 100 + s2
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // s1 = 45, s2 = 55 -> 4500 + 55 = 4555
+    try std.testing.expectEqual(@as(f64, 4555.0), res.num);
+}
+
+test "stu methods with slp and state mutation" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Counter {
+        \\    val: num,
+        \\    step: num,
+        \\    add() {
+        \\        slp.val += slp.step;
+        \\    },
+        \\    get(): num {
+        \\        ret slp.val;
+        \\    }
+        \\}
+        \\let c = Counter { val: 10, step: 5 };
+        \\c.add();
+        \\c.add();
+        \\c.get()
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 20.0), res.num);
+}
+
+test "stu methods without slp and external method definition" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Point {
+        \\    x: num,
+        \\    y: num,
+        \\    dist_sq_zero(px: num, py: num): num {
+        \\        ret px * px + py * py;
+        \\    }
+        \\}
+        \\fun Point.translate(dx: num, dy: num) {
+        \\    slp.x += dx;
+        \\    slp.y += dy;
+        \\}
+        \\let pt = Point { x: 3, y: 4 };
+        \\let d = pt.dist_sq_zero(pt.x, pt.y);
+        \\pt.translate(1, 2);
+        \\d * 100 + (pt.x + pt.y)
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // d = 25; pt.x = 4, pt.y = 6; 2500 + 10 = 2510
+    try std.testing.expectEqual(@as(f64, 2510.0), res.num);
+}
+
+test "stu chained methods and slp calling another method" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu SubEngine {
+        \\    power: num,
+        \\    boost() {
+        \\        slp.power += 10;
+        \\    }
+        \\}
+        \\stu Car {
+        \\    engine: SubEngine,
+        \\    turbo() {
+        \\        slp.engine.boost();
+        \\        slp.engine.boost();
+        \\    }
+        \\}
+        \\let c = Car { engine: SubEngine { power: 100 } };
+        \\c.engine.boost();
+        \\c.turbo();
+        \\c.engine.power
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 100 + 10 (boost) + 20 (turbo) = 130
+    try std.testing.expectEqual(@as(f64, 130.0), res.num);
+}
+

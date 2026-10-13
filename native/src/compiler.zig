@@ -122,6 +122,7 @@ pub const TokenType = enum {
     at,
     dot,
     dot_dot,
+    dot_dot_equal,
 
     l_paren,
     r_paren,
@@ -325,7 +326,10 @@ pub const Lexer = struct {
                 return .{ .tag = .greater, .text = ">" };
             },
             '.' => {
-                if (self.matchChar('.')) return .{ .tag = .dot_dot, .text = ".." };
+                if (self.matchChar('.')) {
+                    if (self.matchChar('=')) return .{ .tag = .dot_dot_equal, .text = "..=" };
+                    return .{ .tag = .dot_dot, .text = ".." };
+                }
                 return .{ .tag = .dot, .text = "." };
             },
             '@' => return .{ .tag = .at, .text = "@" },
@@ -413,6 +417,8 @@ pub const Compiler = struct {
     struct_def_count: usize = 0,
     struct_vars: [32]StructVar = undefined,
     struct_var_count: usize = 0,
+    method_name_buf: [2048]u8 = undefined,
+    method_name_len: usize = 0,
 
     call_fixups: [64]CallFixup = undefined,
     call_fixup_count: usize = 0,
@@ -479,6 +485,14 @@ pub const Compiler = struct {
         fields: [16]StructField = undefined,
         field_count: usize = 0,
         total_slots: usize = 0,
+        methods: [16]StructMethod = undefined,
+        method_count: usize = 0,
+
+        pub const StructMethod = struct {
+            name: []const u8,
+            func_name: []const u8,
+            uses_slp: bool,
+        };
 
         pub fn addField(self: *StructDef, name: []const u8, dt: DataType, child_struct: ?[]const u8, slot_cnt: usize) CompileError!void {
             if (self.field_count >= 16) return error.TooManyLocals;
@@ -494,9 +508,26 @@ pub const Compiler = struct {
             self.total_slots += slot_cnt;
         }
 
+        pub fn addMethod(self: *StructDef, name: []const u8, func_name: []const u8, uses_slp: bool) CompileError!void {
+            if (self.method_count >= 16) return error.TooManyFuncs;
+            self.methods[self.method_count] = .{
+                .name = name,
+                .func_name = func_name,
+                .uses_slp = uses_slp,
+            };
+            self.method_count += 1;
+        }
+
         pub fn findField(self: StructDef, name: []const u8) ?StructField {
             for (self.fields[0..self.field_count]) |f| {
                 if (std.mem.eql(u8, f.name, name)) return f;
+            }
+            return null;
+        }
+
+        pub fn findMethod(self: StructDef, name: []const u8) ?StructMethod {
+            for (self.methods[0..self.method_count]) |m| {
+                if (std.mem.eql(u8, m.name, name)) return m;
             }
             return null;
         }
@@ -732,6 +763,13 @@ pub const Compiler = struct {
 
     fn findStructDef(self: *Compiler, name: []const u8) ?StructDef {
         for (self.struct_defs[0..self.struct_def_count]) |d| {
+            if (std.mem.eql(u8, d.name, name)) return d;
+        }
+        return null;
+    }
+
+    fn findStructDefPtr(self: *Compiler, name: []const u8) ?*StructDef {
+        for (self.struct_defs[0..self.struct_def_count]) |*d| {
             if (std.mem.eql(u8, d.name, name)) return d;
         }
         return null;
@@ -1323,30 +1361,48 @@ pub const Compiler = struct {
         self.advance();
         if (!self.match(.l_brace)) return error.SyntaxError;
 
-        var def = StructDef{ .name = sname };
+        const def = StructDef{ .name = sname };
+        try self.addStructDef(def);
+        const def_idx = self.struct_def_count - 1;
+
         while (self.cur.tag != .r_brace and self.cur.tag != .eof) {
-            if (self.cur.tag != .ident) return error.SyntaxError;
-            const fname = self.cur.text;
-            self.advance();
-            if (!self.match(.colon)) return error.SyntaxError;
-            if (self.cur.tag != .ident) return error.SyntaxError;
-            const tname = self.cur.text;
-            self.advance();
-            if (std.mem.eql(u8, tname, "num")) {
-                try def.addField(fname, .num, null, 1);
-            } else if (std.mem.eql(u8, tname, "str")) {
-                try def.addField(fname, .str, null, 1);
-            } else if (self.findStructDef(tname)) |child_sdef| {
-                try def.addField(fname, .unknown, tname, child_sdef.total_slots);
+            if (self.match(.kw_fun)) {
+                if (self.cur.tag != .ident) return error.SyntaxError;
+                const mname = self.cur.text;
+                self.advance();
+                try self.parseFuncInternal(sname, mname);
+                _ = self.match(.comma);
+                _ = self.match(.semicolon);
+            } else if (self.cur.tag == .ident and self.peek.tag == .l_paren) {
+                const mname = self.cur.text;
+                self.advance();
+                try self.parseFuncInternal(sname, mname);
+                _ = self.match(.comma);
+                _ = self.match(.semicolon);
+            } else if (self.cur.tag == .ident and self.peek.tag == .colon) {
+                const fname = self.cur.text;
+                self.advance();
+                self.advance();
+                if (self.cur.tag != .ident) return error.SyntaxError;
+                const tname = self.cur.text;
+                self.advance();
+                if (std.mem.eql(u8, tname, "num")) {
+                    try self.struct_defs[def_idx].addField(fname, .num, null, 1);
+                } else if (std.mem.eql(u8, tname, "str")) {
+                    try self.struct_defs[def_idx].addField(fname, .str, null, 1);
+                } else if (self.findStructDef(tname)) |child_sdef| {
+                    try self.struct_defs[def_idx].addField(fname, .unknown, tname, child_sdef.total_slots);
+                } else {
+                    return error.UnknownType;
+                }
+                _ = self.match(.comma);
+                _ = self.match(.semicolon);
             } else {
-                return error.UnknownType;
+                return error.SyntaxError;
             }
-            _ = self.match(.comma);
-            _ = self.match(.semicolon);
         }
         if (!self.match(.r_brace)) return error.SyntaxError;
         _ = self.match(.semicolon);
-        try self.addStructDef(def);
     }
 
     fn parseStructInit(self: *Compiler, sdef: StructDef, base_slot: usize, is_state: bool, is_decl: bool) CompileError!void {
@@ -1529,7 +1585,7 @@ pub const Compiler = struct {
     fn isCaseLabel(self: *Compiler) bool {
         if (self.cur.tag == .ident and std.mem.eql(u8, self.cur.text, "_") and (self.peek.tag == .colon or self.peek.tag == .arrow)) return true;
         if (self.cur.tag == .string and (self.peek.tag == .colon or self.peek.tag == .arrow or self.peek.tag == .pipe)) return true;
-        if (self.cur.tag == .number and (self.peek.tag == .colon or self.peek.tag == .arrow or self.peek.tag == .pipe or self.peek.tag == .dot_dot)) return true;
+        if (self.cur.tag == .number and (self.peek.tag == .colon or self.peek.tag == .arrow or self.peek.tag == .pipe or self.peek.tag == .dot_dot or self.peek.tag == .dot_dot_equal)) return true;
         if (self.cur.tag == .minus and self.peek.tag == .number) return true;
         return false;
     }
@@ -1551,6 +1607,7 @@ pub const Compiler = struct {
             kind: PatKind,
             num_val: f64 = 0.0,
             range_max: f64 = 0.0,
+            is_inclusive: bool = false,
             str_val: []const u8 = "",
         };
         const JmpArm = struct {
@@ -1585,7 +1642,16 @@ pub const Compiler = struct {
                             n = self.cur.num_val;
                             self.advance();
                         }
-                        if (self.match(.dot_dot)) {
+                        var is_range = false;
+                        var is_inclusive = false;
+                        if (self.match(.dot_dot_equal)) {
+                            is_range = true;
+                            is_inclusive = true;
+                        } else if (self.match(.dot_dot)) {
+                            is_range = true;
+                            is_inclusive = false;
+                        }
+                        if (is_range) {
                             var n2: f64 = 0.0;
                             if (self.match(.minus)) {
                                 if (self.cur.tag != .number) return error.SyntaxError;
@@ -1595,7 +1661,7 @@ pub const Compiler = struct {
                                 n2 = self.cur.num_val;
                                 self.advance();
                             } else return error.SyntaxError;
-                            item = .{ .kind = .range, .num_val = n, .range_max = n2 };
+                            item = .{ .kind = .range, .num_val = n, .range_max = n2, .is_inclusive = is_inclusive };
                         } else {
                             item = .{ .kind = .num, .num_val = n };
                         }
@@ -1763,7 +1829,11 @@ pub const Compiler = struct {
                             const skip_range = try self.emit(.jmp_if_zero, 0);
                             _ = try self.emit(.load_local, @intCast(target_slot));
                             _ = try self.emit(.push_num, @bitCast(it.range_max));
-                            _ = try self.emit(.le, 0);
+                            if (it.is_inclusive) {
+                                _ = try self.emit(.le, 0);
+                            } else {
+                                _ = try self.emit(.lt, 0);
+                            }
                             _ = try self.emit(.jmp_if_nonzero, @intCast(a.entry_ip));
                             self.patchJump(skip_range, self.op_count);
                         },
@@ -1801,6 +1871,194 @@ pub const Compiler = struct {
             self.last_stmt_had_value = true;
         }
         return is_expr;
+    }
+
+    fn formatMethodName(self: *Compiler, rs: []const u8, mname: []const u8) CompileError![]const u8 {
+        const needed = rs.len + 1 + mname.len;
+        if (self.method_name_len + needed > self.method_name_buf.len) return error.TooManyFuncs;
+        const start = self.method_name_len;
+        @memcpy(self.method_name_buf[self.method_name_len .. self.method_name_len + rs.len], rs);
+        self.method_name_len += rs.len;
+        self.method_name_buf[self.method_name_len] = '.';
+        self.method_name_len += 1;
+        @memcpy(self.method_name_buf[self.method_name_len .. self.method_name_len + mname.len], mname);
+        self.method_name_len += mname.len;
+        return self.method_name_buf[start..self.method_name_len];
+    }
+
+    fn parseFuncInternal(self: *Compiler, receiver_struct: ?[]const u8, method_name: []const u8) CompileError!void {
+        _ = self.match(.l_paren);
+
+        const full_name = if (receiver_struct) |rs|
+            try self.formatMethodName(rs, method_name)
+        else
+            method_name;
+
+        const saved_func_name = self.current_func_name;
+        self.current_func_name = full_name;
+
+        var uses_slp = false;
+        if (receiver_struct != null) {
+            var scan_lexer = self.lexer;
+            var brace_depth: usize = 0;
+            var in_body = false;
+            while (true) {
+                const tok = scan_lexer.nextToken();
+                if (tok.tag == .eof) break;
+                if (tok.tag == .l_brace) {
+                    brace_depth += 1;
+                    in_body = true;
+                } else if (tok.tag == .r_brace) {
+                    if (brace_depth > 0) brace_depth -= 1;
+                    if (brace_depth == 0 and in_body) break;
+                } else if (tok.tag == .ident and std.mem.eql(u8, tok.text, "slp")) {
+                    uses_slp = true;
+                    break;
+                }
+            }
+        }
+
+        var param_count: usize = 0;
+        var param_names: [8][]const u8 = undefined;
+        var param_types: [8]DataType = @splat(.unknown);
+        var param_consts: [8]bool = @splat(false);
+        var param_annots: [8]?TypeAnnotation = @splat(null);
+
+        if (uses_slp) {
+            param_names[0] = "slp";
+            param_types[0] = .unknown;
+            param_consts[0] = false;
+            param_annots[0] = TypeAnnotation{
+                .data_type = .unknown,
+                .struct_name = receiver_struct.?,
+                .is_copy = false,
+                .is_const = false,
+            };
+            param_count = 1;
+        }
+
+        while (self.cur.tag != .r_paren and self.cur.tag != .eof) {
+            var is_con = false;
+            if (self.match(.kw_con)) {
+                is_con = true;
+            }
+            if (param_count >= 8) return error.TooManyLocals;
+            param_consts[param_count] = is_con;
+            param_names[param_count] = self.cur.text;
+            self.advance();
+            const p_annot = try self.parseTypeAnnotation();
+            param_annots[param_count] = p_annot;
+            param_types[param_count] = if (p_annot) |a| a.data_type else .unknown;
+            param_count += 1;
+            if (!self.match(.comma)) break;
+        }
+        _ = self.match(.r_paren);
+        const ret_annot = try self.parseTypeAnnotation();
+        const saved_func_ret_type = self.current_func_ret_type;
+        self.current_func_ret_type = if (ret_annot) |a| a.data_type else .unknown;
+
+        const skip_jmp = try self.emit(.jmp, 0);
+        const entry_ip = self.op_count;
+        const fidx = try self.registerFunc(full_name, entry_ip, param_count);
+        self.func_param_annots[fidx] = param_annots;
+
+        if (receiver_struct) |rs| {
+            if (self.findStructDefPtr(rs)) |sdef_ptr| {
+                try sdef_ptr.addMethod(method_name, full_name, uses_slp);
+            }
+        }
+
+        const saved_locals = self.locals;
+        const saved_local_types = self.local_types;
+        const saved_local_consts = self.local_consts;
+        const saved_local_count = self.local_count;
+        self.local_count = 0;
+        const saved_arrays = self.array_count;
+        const saved_struct_vars = self.struct_var_count;
+        const saved_labels = self.label_count;
+        const saved_label_fixups = self.label_fixup_count;
+
+        var p = param_count;
+        while (p > 0) {
+            p -= 1;
+            const pname = param_names[p];
+            const is_con = param_consts[p];
+            const annot = param_annots[p];
+            if (annot != null and annot.?.struct_name != null) {
+                const sname = annot.?.struct_name.?;
+                const sdef = self.findStructDef(sname) orelse return error.UnknownType;
+                if (annot.?.is_copy) {
+                    const ref_slot = try self.addLocal("");
+                    _ = try self.emit(.store_local, @intCast(ref_slot));
+                    const base_slot = self.local_count;
+                    for (0..sdef.total_slots) |_| {
+                        _ = try self.addLocal("");
+                    }
+                    try self.addStructVar(pname, sname, base_slot, false, false);
+                    if (self.struct_var_count > 0) {
+                        self.struct_vars[self.struct_var_count - 1].is_const = is_con;
+                    }
+                    for (0..sdef.total_slots) |fi| {
+                        _ = try self.emit(.load_local, @intCast(ref_slot));
+                        _ = try self.emit(.load_local_elem, @intCast(fi));
+                        _ = try self.emit(.store_local, @intCast(base_slot + fi));
+                    }
+                } else {
+                    const slot = try self.addLocal(pname);
+                    self.local_consts[slot] = is_con;
+                    _ = try self.emit(.store_local, @intCast(slot));
+                    try self.addStructVar(pname, sname, slot, false, true);
+                    if (self.struct_var_count > 0) {
+                        self.struct_vars[self.struct_var_count - 1].is_const = is_con;
+                        self.struct_vars[self.struct_var_count - 1].is_param_ref = true;
+                    }
+                }
+            } else {
+                const slot = try self.addLocal(pname);
+                self.local_types[slot] = param_types[p];
+                self.local_consts[slot] = is_con;
+                _ = try self.emit(.store_local, @intCast(slot));
+            }
+        }
+
+        if (self.match(.arrow)) {
+            try self.parseExpression();
+            if (self.current_func_ret_type != .unknown and self.last_expr_type != .unknown and self.current_func_ret_type != self.last_expr_type) {
+                return error.TypeMismatch;
+            }
+            _ = try self.emit(.ret, 0);
+        } else if (self.cur.tag == .l_brace) {
+            self.current_func_had_ret = false;
+            _ = try self.parseBlock();
+            if (!self.current_func_had_ret) {
+                if (receiver_struct != null) {
+                    _ = try self.emit(.push_0, 0);
+                    _ = try self.emit(.ret, 0);
+                } else {
+                    return error.MissingReturn;
+                }
+            } else {
+                _ = try self.emit(.ret, 0);
+            }
+        } else {
+            return error.ExpectedFunctionBody;
+        }
+
+        self.current_func_name = saved_func_name;
+        self.current_func_ret_type = saved_func_ret_type;
+        self.array_count = saved_arrays;
+        self.struct_var_count = saved_struct_vars;
+        self.locals = saved_locals;
+        self.local_types = saved_local_types;
+        self.local_consts = saved_local_consts;
+        self.local_count = saved_local_count;
+        for (self.label_fixups[saved_label_fixups..self.label_fixup_count]) |lf| {
+            if (lf.name.len > 0) return error.UndefinedVariable;
+        }
+        self.label_count = saved_labels;
+        self.label_fixup_count = saved_label_fixups;
+        self.patchJump(skip_jmp, self.op_count);
+        _ = self.match(.semicolon);
     }
 
     fn parseStatement(self: *Compiler) CompileError!void {
@@ -2267,128 +2525,16 @@ pub const Compiler = struct {
         }
 
         if (self.match(.kw_fun)) {
-            const name = self.cur.text;
+            var name = self.cur.text;
             self.advance();
-            _ = self.match(.l_paren);
-
-            const saved_func_name = self.current_func_name;
-            self.current_func_name = name;
-
-            var param_count: usize = 0;
-            var param_names: [8][]const u8 = undefined;
-            var param_types: [8]DataType = @splat(.unknown);
-            var param_consts: [8]bool = @splat(false);
-            var param_annots: [8]?TypeAnnotation = @splat(null);
-
-            while (self.cur.tag != .r_paren and self.cur.tag != .eof) {
-                var is_con = false;
-                if (self.match(.kw_con)) {
-                    is_con = true;
-                }
-                param_consts[param_count] = is_con;
-                param_names[param_count] = self.cur.text;
+            var rec_sname: ?[]const u8 = null;
+            if (self.match(.dot)) {
+                rec_sname = name;
+                if (self.cur.tag != .ident) return error.SyntaxError;
+                name = self.cur.text;
                 self.advance();
-                const p_annot = try self.parseTypeAnnotation();
-                param_annots[param_count] = p_annot;
-                param_types[param_count] = if (p_annot) |a| a.data_type else .unknown;
-                param_count += 1;
-                if (!self.match(.comma)) break;
             }
-            _ = self.match(.r_paren);
-            const ret_annot = try self.parseTypeAnnotation();
-            const saved_func_ret_type = self.current_func_ret_type;
-            self.current_func_ret_type = if (ret_annot) |a| a.data_type else .unknown;
-
-            const skip_jmp = try self.emit(.jmp, 0);
-            const entry_ip = self.op_count;
-            const fidx = try self.registerFunc(name, entry_ip, param_count);
-            self.func_param_annots[fidx] = param_annots;
-
-            const saved_locals = self.locals;
-            const saved_local_types = self.local_types;
-            const saved_local_consts = self.local_consts;
-            const saved_local_count = self.local_count;
-            self.local_count = 0;
-            const saved_arrays = self.array_count;
-            const saved_struct_vars = self.struct_var_count;
-            const saved_labels = self.label_count;
-            const saved_label_fixups = self.label_fixup_count;
-
-            var p = param_count;
-            while (p > 0) {
-                p -= 1;
-                const pname = param_names[p];
-                const is_con = param_consts[p];
-                const annot = param_annots[p];
-                if (annot != null and annot.?.struct_name != null) {
-                    const sname = annot.?.struct_name.?;
-                    const sdef = self.findStructDef(sname) orelse return error.UnknownType;
-                    if (annot.?.is_copy) {
-                        const ref_slot = try self.addLocal("");
-                        _ = try self.emit(.store_local, @intCast(ref_slot));
-                        const base_slot = self.local_count;
-                        for (0..sdef.total_slots) |_| {
-                            _ = try self.addLocal("");
-                        }
-                        try self.addStructVar(pname, sname, base_slot, false, false);
-                        if (self.struct_var_count > 0) {
-                            self.struct_vars[self.struct_var_count - 1].is_const = is_con;
-                        }
-                        for (0..sdef.total_slots) |fi| {
-                            _ = try self.emit(.load_local, @intCast(ref_slot));
-                            _ = try self.emit(.load_local_elem, @intCast(fi));
-                            _ = try self.emit(.store_local, @intCast(base_slot + fi));
-                        }
-                    } else {
-                        const slot = try self.addLocal(pname);
-                        self.local_consts[slot] = is_con;
-                        _ = try self.emit(.store_local, @intCast(slot));
-                        try self.addStructVar(pname, sname, slot, false, true);
-                        if (self.struct_var_count > 0) {
-                            self.struct_vars[self.struct_var_count - 1].is_const = is_con;
-                            self.struct_vars[self.struct_var_count - 1].is_param_ref = true;
-                        }
-                    }
-                } else {
-                    const slot = try self.addLocal(pname);
-                    self.local_types[slot] = param_types[p];
-                    self.local_consts[slot] = is_con;
-                    _ = try self.emit(.store_local, @intCast(slot));
-                }
-            }
-
-            if (self.match(.arrow)) {
-                try self.parseExpression();
-                if (self.current_func_ret_type != .unknown and self.last_expr_type != .unknown and self.current_func_ret_type != self.last_expr_type) {
-                    return error.TypeMismatch;
-                }
-                _ = try self.emit(.ret, 0);
-            } else if (self.cur.tag == .l_brace) {
-                self.current_func_had_ret = false;
-                _ = try self.parseBlock();
-                if (!self.current_func_had_ret) {
-                    return error.MissingReturn;
-                }
-                _ = try self.emit(.ret, 0);
-            } else {
-                return error.ExpectedFunctionBody;
-            }
-
-            self.current_func_name = saved_func_name;
-            self.current_func_ret_type = saved_func_ret_type;
-            self.array_count = saved_arrays;
-            self.struct_var_count = saved_struct_vars;
-            self.locals = saved_locals;
-            self.local_types = saved_local_types;
-            self.local_consts = saved_local_consts;
-            self.local_count = saved_local_count;
-            for (self.label_fixups[saved_label_fixups..self.label_fixup_count]) |lf| {
-                if (lf.name.len > 0) return error.UndefinedVariable;
-            }
-            self.label_count = saved_labels;
-            self.label_fixup_count = saved_label_fixups;
-            self.patchJump(skip_jmp, self.op_count);
-            _ = self.match(.semicolon);
+            try self.parseFuncInternal(rec_sname, name);
             return;
         }
 
@@ -2501,19 +2647,35 @@ pub const Compiler = struct {
             var fname = self.cur.text;
             self.advance();
             var curr_sdef = sdef;
-            var field = curr_sdef.findField(fname) orelse return error.UndefinedVariable;
-            var total_offset: usize = field.offset;
-            while (self.cur.tag == .dot) {
-                self.advance();
-                if (self.cur.tag != .ident) return error.SyntaxError;
-                fname = self.cur.text;
-                self.advance();
-                const child_sname = field.struct_name orelse return error.SyntaxError;
-                curr_sdef = self.findStructDef(child_sname) orelse return error.SyntaxError;
-                field = curr_sdef.findField(fname) orelse return error.UndefinedVariable;
-                total_offset += field.offset;
-            }
-            const slot = svar.base_slot + total_offset;
+            const field_opt = curr_sdef.findField(fname);
+            if (field_opt == null) {
+                self.lexer.pos = saved_pos;
+                self.cur = saved_cur;
+                self.peek = saved_peek;
+                self.op_count = saved_op_count;
+            } else {
+                var field = field_opt.?;
+                var total_offset: usize = field.offset;
+                var dot_ok = true;
+                while (self.cur.tag == .dot) {
+                    self.advance();
+                    if (self.cur.tag != .ident) { dot_ok = false; break; }
+                    fname = self.cur.text;
+                    self.advance();
+                    const child_sname = field.struct_name orelse { dot_ok = false; break; };
+                    curr_sdef = self.findStructDef(child_sname) orelse { dot_ok = false; break; };
+                    const child_f = curr_sdef.findField(fname);
+                    if (child_f == null) { dot_ok = false; break; }
+                    field = child_f.?;
+                    total_offset += field.offset;
+                }
+                if (!dot_ok) {
+                    self.lexer.pos = saved_pos;
+                    self.cur = saved_cur;
+                    self.peek = saved_peek;
+                    self.op_count = saved_op_count;
+                } else {
+                const slot = svar.base_slot + total_offset;
 
             const op_tok = self.cur.tag;
             if (op_tok != .equal and op_tok != .plus_equal and op_tok != .minus_equal and op_tok != .star_equal and op_tok != .slash_equal) {
@@ -2525,9 +2687,21 @@ pub const Compiler = struct {
                 self.advance();
 
             if (svar.is_param_ref) {
-                if (op_tok != .equal) return error.SyntaxError;
                 _ = try self.emit(.load_local, @intCast(svar.base_slot));
-                try self.parseExpression();
+                if (op_tok != .equal) {
+                    _ = try self.emit(.load_local, @intCast(svar.base_slot));
+                    _ = try self.emit(.load_local_elem, @intCast(total_offset));
+                    try self.parseExpression();
+                    switch (op_tok) {
+                        .plus_equal => _ = try self.emit(.add, 0),
+                        .minus_equal => _ = try self.emit(.sub, 0),
+                        .star_equal => _ = try self.emit(.mul, 0),
+                        .slash_equal => _ = try self.emit(.div, 0),
+                        else => return error.SyntaxError,
+                    }
+                } else {
+                    try self.parseExpression();
+                }
                 _ = try self.emit(.store_local_elem, @intCast(total_offset));
                 _ = self.match(.semicolon);
                 return;
@@ -2622,8 +2796,10 @@ pub const Compiler = struct {
             } else {
                 _ = try self.emit(.store_local, @intCast(slot));
             }
-            _ = self.match(.semicolon);
-            return;
+                _ = self.match(.semicolon);
+                return;
+                }
+                }
             }
         }
 
@@ -2918,7 +3094,10 @@ pub const Compiler = struct {
             }
             _ = try self.emit(.store_local, @intCast(v_slot));
 
-            _ = try self.parseBlock();
+            const had_val = try self.parseBlock();
+            if (had_val) {
+                _ = try self.emit(.pop, 0);
+            }
 
             const continue_ip = self.op_count;
             const current_loop = self.loops[self.loop_depth - 1];
@@ -2958,7 +3137,14 @@ pub const Compiler = struct {
             limit_slot = try self.addLocal("");
 
             try self.parseExpression();
-            if (self.match(.dot_dot)) {
+            if (self.match(.dot_dot_equal)) {
+                is_range = true;
+                _ = try self.emit(.store_local, @intCast(vslot));
+                try self.parseExpression();
+                _ = try self.emit(.push_1, 0);
+                _ = try self.emit(.add, 0);
+                _ = try self.emit(.store_local, @intCast(limit_slot));
+            } else if (self.match(.dot_dot)) {
                 is_range = true;
                 _ = try self.emit(.store_local, @intCast(vslot));
                 try self.parseExpression();
@@ -2986,7 +3172,10 @@ pub const Compiler = struct {
 
         const loop_body_ip = self.op_count;
 
-        _ = try self.parseBlock();
+        const had_val = try self.parseBlock();
+        if (had_val) {
+            _ = try self.emit(.pop, 0);
+        }
 
         const continue_ip = self.op_count;
         const current_loop = self.loops[self.loop_depth - 1];
@@ -3320,33 +3509,115 @@ pub const Compiler = struct {
                     var fname = self.cur.text;
                     self.advance();
                     var curr_sdef = self.findStructDef(svar.struct_name) orelse return error.SyntaxError;
-                    var field = curr_sdef.findField(fname) orelse return error.UndefinedVariable;
-                    var total_offset: usize = field.offset;
-                    var curr_dt: DataType = field.data_type;
+                    var total_offset: usize = 0;
+                    var is_method = false;
+                    var method_info: ?StructDef.StructMethod = null;
 
-                    while (self.cur.tag == .dot) {
-                        self.advance();
-                        if (self.cur.tag != .ident) return error.SyntaxError;
-                        fname = self.cur.text;
-                        self.advance();
-                        const child_sname = field.struct_name orelse return error.SyntaxError;
-                        curr_sdef = self.findStructDef(child_sname) orelse return error.SyntaxError;
-                        field = curr_sdef.findField(fname) orelse return error.UndefinedVariable;
+                    if (curr_sdef.findMethod(fname)) |m| {
+                        if (self.cur.tag == .l_paren) {
+                            is_method = true;
+                            method_info = m;
+                        }
+                    }
+
+                    if (!is_method) {
+                        var field = curr_sdef.findField(fname) orelse return error.UndefinedVariable;
                         total_offset += field.offset;
-                        curr_dt = field.data_type;
+                        var curr_dt: DataType = field.data_type;
+
+                        while (self.cur.tag == .dot) {
+                            self.advance();
+                            if (self.cur.tag != .ident) return error.SyntaxError;
+                            fname = self.cur.text;
+                            self.advance();
+                            const child_sname = field.struct_name orelse return error.SyntaxError;
+                            curr_sdef = self.findStructDef(child_sname) orelse return error.SyntaxError;
+                            if (curr_sdef.findMethod(fname)) |m| {
+                                if (self.cur.tag == .l_paren) {
+                                    is_method = true;
+                                    method_info = m;
+                                    break;
+                                }
+                            }
+                            field = curr_sdef.findField(fname) orelse return error.UndefinedVariable;
+                            total_offset += field.offset;
+                            curr_dt = field.data_type;
+                        }
+
+                        if (!is_method) {
+                            const slot = svar.base_slot + total_offset;
+                            self.last_expr_type = curr_dt;
+                            if (svar.is_param_ref) {
+                                _ = try self.emit(.load_local, @intCast(svar.base_slot));
+                                _ = try self.emit(.load_local_elem, @intCast(total_offset));
+                            } else if (svar.is_state) {
+                                _ = try self.emit(.load_state, @intCast(slot));
+                            } else {
+                                _ = try self.emit(.load_local, @intCast(slot));
+                            }
+                            return;
+                        }
                     }
 
-                    const slot = svar.base_slot + total_offset;
-                    self.last_expr_type = curr_dt;
-                    if (svar.is_param_ref) {
-                        _ = try self.emit(.load_local, @intCast(svar.base_slot));
-                        _ = try self.emit(.load_local_elem, @intCast(total_offset));
-                    } else if (svar.is_state) {
-                        _ = try self.emit(.load_state, @intCast(slot));
-                    } else {
-                        _ = try self.emit(.load_local, @intCast(slot));
+                    const m = method_info.?;
+                    var call_arg_count: usize = 0;
+                    if (m.uses_slp) {
+                        if (svar.is_param_ref) {
+                            _ = try self.emit(.load_local, @intCast(svar.base_slot));
+                            const adj: f64 = @floatFromInt(@as(i64, @intCast(total_offset)) - @as(i64, @intCast(self.local_count)));
+                            if (adj != 0.0) {
+                                _ = try self.emit(.push_num, @bitCast(adj));
+                                _ = try self.emit(.add, 0);
+                            }
+                        } else {
+                            var base_slot = svar.base_slot + total_offset;
+                            if (svar.is_state) {
+                                const tmp_base = self.local_count;
+                                for (0..curr_sdef.total_slots) |si| {
+                                    _ = try self.addLocal("");
+                                    _ = try self.emit(.load_state, @intCast(base_slot + si));
+                                    _ = try self.emit(.store_local, @intCast(tmp_base + si));
+                                }
+                                base_slot = tmp_base;
+                            }
+                            const rel_off: f64 = @floatFromInt(@as(i64, @intCast(base_slot)) - @as(i64, @intCast(self.local_count)));
+                            _ = try self.emit(.push_num, @bitCast(rel_off));
+                        }
+                        call_arg_count += 1;
                     }
+
+                    _ = self.match(.l_paren);
+                    while (self.cur.tag != .r_paren and self.cur.tag != .eof) {
+                        try self.parseExpression();
+                        call_arg_count += 1;
+                        if (!self.match(.comma)) break;
+                    }
+                    if (!self.match(.r_paren)) return error.SyntaxError;
+
+                    try self.emitCall(m.func_name, call_arg_count);
                     return;
+                }
+            }
+
+            if (self.findStructDef(name)) |sdef| {
+                if (self.peek.tag == .dot) {
+                    self.advance();
+                    self.advance();
+                    if (self.cur.tag != .ident) return error.SyntaxError;
+                    const mname = self.cur.text;
+                    self.advance();
+                    if (sdef.findMethod(mname)) |m| {
+                        _ = self.match(.l_paren);
+                        var call_arg_count: usize = 0;
+                        while (self.cur.tag != .r_paren and self.cur.tag != .eof) {
+                            try self.parseExpression();
+                            call_arg_count += 1;
+                            if (!self.match(.comma)) break;
+                        }
+                        if (!self.match(.r_paren)) return error.SyntaxError;
+                        try self.emitCall(m.func_name, call_arg_count);
+                        return;
+                    }
                 }
             }
 
@@ -3414,19 +3685,29 @@ pub const Compiler = struct {
                                 if (self.cur.tag == .ident and self.peek.tag != .dot and self.findStructVar(self.cur.text) != null) {
                                     const src_svar = self.findStructVar(self.cur.text).?;
                                     self.advance();
-                                    var base_slot = src_svar.base_slot;
-                                    if (src_svar.is_state) {
-                                        const tmp_base = self.local_count;
-                                        for (0..sdef.total_slots) |si| {
-                                            _ = try self.addLocal("");
-                                            _ = try self.emit(.load_state, @intCast(src_svar.base_slot + si));
-                                            _ = try self.emit(.store_local, @intCast(tmp_base + si));
+                                    if (src_svar.is_param_ref) {
+                                        _ = try self.emit(.load_local, @intCast(src_svar.base_slot));
+                                        const adj: f64 = @floatFromInt(-@as(i64, @intCast(self.local_count)));
+                                        if (adj != 0.0) {
+                                            _ = try self.emit(.push_num, @bitCast(adj));
+                                            _ = try self.emit(.add, 0);
                                         }
-                                        base_slot = tmp_base;
+                                        handled = true;
+                                    } else {
+                                        var base_slot = src_svar.base_slot;
+                                        if (src_svar.is_state) {
+                                            const tmp_base = self.local_count;
+                                            for (0..sdef.total_slots) |si| {
+                                                _ = try self.addLocal("");
+                                                _ = try self.emit(.load_state, @intCast(src_svar.base_slot + si));
+                                                _ = try self.emit(.store_local, @intCast(tmp_base + si));
+                                            }
+                                            base_slot = tmp_base;
+                                        }
+                                        const rel_off: f64 = @floatFromInt(@as(i64, @intCast(base_slot)) - @as(i64, @intCast(self.local_count)));
+                                        _ = try self.emit(.push_num, @bitCast(rel_off));
+                                        handled = true;
                                     }
-                                    const rel_off: f64 = @floatFromInt(@as(i64, @intCast(base_slot)) - @as(i64, @intCast(self.local_count)));
-                                    _ = try self.emit(.push_num, @bitCast(rel_off));
-                                    handled = true;
                                 }
                             }
                         }
