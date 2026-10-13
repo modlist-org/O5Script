@@ -166,15 +166,32 @@ test "bitwise and shift operators" {
     try std.testing.expectEqual(@as(f64, 31.0), res.num);
 }
 
-test "math builtins pow clamp lerp" {
+test "math builtins through module imports" {
     const allocator = std.testing.allocator;
-    const src = "pow(2, 4) + clamp(15, 0, 10) + lerp(0, 100, 0.5)";
+    const src =
+        \\con Std = @("std");
+        \\con Math = Std.Math;
+        \\Math.pow(2, 4) + Math.clamp(15, 0, 10) + Math.lerp(0, 100, 0.5)
+    ;
     const prog = try compiler.compileSource(src, allocator);
     defer prog.deinit();
 
     // 16 + 10 + 50 = 76
     const res = try vm.run(prog, 0, &[_]f64{});
     try std.testing.expectEqual(@as(f64, 76.0), res.num);
+}
+
+test "direct submodule import and constants" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\con Math = @("std.math");
+        \\Math.sin(0) + Math.pi
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, std.math.pi), res.num);
 }
 
 test "function definition and calls" {

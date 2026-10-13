@@ -124,3 +124,25 @@ Registers tags directly for the Overlayer engine:
 - External Host Tags: `#<TagName>` (e.g. `#CurBpm`, `#Score`, `#CamRotRad`).
 - Single-line comments: `// ...`
 - Multi-line comments: `/* ... */`
+
+---
+
+## 7. Modules & Imports (`@`)
+
+O5Script has **no global built-in functions** to prevent scope pollution and maintain strict zero-cost abstractions. All math and system utilities must be explicitly imported via compile-time module bindings using `@("...")`.
+
+### Module Syntax
+- Import standard library:
+  ```o5s
+  con Std = @("std");
+  con Math = Std.Math;
+  ```
+- Direct submodule import:
+  ```o5s
+  con Math = @("std.math");
+  ```
+
+### `Std.Math` Functions & Constants
+- Functions: `Math.sin(x)`, `Math.cos(x)`, `Math.tan(x)`, `Math.asin(x)`, `Math.acos(x)`, `Math.atan(x)`, `Math.atan2(y, x)`, `Math.sqrt(x)`, `Math.abs(x)`, `Math.floor(x)`, `Math.ceil(x)`, `Math.round(x)`, `Math.min(a, b)`, `Math.max(a, b)`, `Math.clamp(v, min, max)`, `Math.lerp(a, b, t)`, `Math.pow(a, b)`, `Math.log(x)`, `Math.exp(x)`
+- Constants (compile-time folded): `Math.pi`, `Math.e`, `Math.tau`
+

@@ -85,6 +85,8 @@ pub const TokenType = enum {
     question,
     colon,
     arrow,
+    at,
+    dot,
     dot_dot,
 
     l_paren,
@@ -281,8 +283,9 @@ pub const Lexer = struct {
             },
             '.' => {
                 if (self.matchChar('.')) return .{ .tag = .dot_dot, .text = ".." };
-                return .{ .tag = .eof, .text = "." };
+                return .{ .tag = .dot, .text = "." };
             },
+            '@' => return .{ .tag = .at, .text = "@" },
             '?' => return .{ .tag = .question, .text = "?" },
             ':' => return .{ .tag = .colon, .text = ":" },
             '(' => return .{ .tag = .l_paren, .text = "(" },
@@ -337,10 +340,23 @@ pub const Compiler = struct {
     funcs: [max_funcs]FuncDef = undefined,
     func_count: usize = 0,
 
+    modules: [16]ModuleBinding = undefined,
+    module_count: usize = 0,
+
     loops: [max_loops]LoopContext = undefined,
     loop_depth: usize = 0,
 
     allocator: std.mem.Allocator,
+
+    pub const ModuleKind = enum {
+        std,
+        math,
+    };
+
+    pub const ModuleBinding = struct {
+        name: []const u8,
+        kind: ModuleKind,
+    };
 
     pub fn init(src: []const u8, allocator: std.mem.Allocator) Compiler {
         var c = Compiler{
@@ -348,6 +364,7 @@ pub const Compiler = struct {
             .cur = undefined,
             .peek = undefined,
             .allocator = allocator,
+            .module_count = 0,
         };
         c.cur = c.lexer.nextToken();
         c.peek = c.lexer.nextToken();
@@ -438,6 +455,20 @@ pub const Compiler = struct {
             if (std.mem.eql(u8, f.name, name)) return i;
         }
         return null;
+    }
+
+    fn findModule(self: *Compiler, name: []const u8) ?ModuleKind {
+        for (self.modules[0..self.module_count]) |m| {
+            if (std.mem.eql(u8, m.name, name)) return m.kind;
+        }
+        return null;
+    }
+
+    fn addModule(self: *Compiler, name: []const u8, kind: ModuleKind) void {
+        if (self.module_count < 16) {
+            self.modules[self.module_count] = .{ .name = name, .kind = kind };
+            self.module_count += 1;
+        }
     }
 
     fn findBuiltin(name: []const u8) ?struct { id: Builtin, arity: u8 } {
@@ -571,6 +602,48 @@ pub const Compiler = struct {
             self.advance();
             self.skipTypeAnnotation();
             _ = self.match(.equal);
+
+            // 1. Module import: con Std = @("std"); or con Math = @("std.math");
+            if (self.match(.at)) {
+                _ = self.match(.l_paren);
+                if (self.cur.tag == .string) {
+                    const raw = self.cur.text;
+                    const path = if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"')
+                        raw[1 .. raw.len - 1]
+                    else
+                        raw;
+                    self.advance();
+                    _ = self.match(.r_paren);
+                    _ = self.match(.semicolon);
+
+                    if (std.ascii.eqlIgnoreCase(path, "std")) {
+                        self.addModule(name, .std);
+                        return;
+                    } else if (std.ascii.eqlIgnoreCase(path, "std.math")) {
+                        self.addModule(name, .math);
+                        return;
+                    }
+                    return;
+                }
+            }
+
+            // 2. Submodule access: con Math = Std.Math;
+            if (self.cur.tag == .ident) {
+                const target_id = self.cur.text;
+                if (self.findModule(target_id)) |mod| {
+                    if (mod == .std and self.peek.tag == .dot) {
+                        self.advance(); // past target_id
+                        self.advance(); // past .
+                        if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "math")) {
+                            self.advance();
+                            _ = self.match(.semicolon);
+                            self.addModule(name, .math);
+                            return;
+                        }
+                    }
+                }
+            }
+
             try self.parseExpression();
             const slot = try self.addLocal(name);
             _ = try self.emit(.store_local, @intCast(slot));
@@ -1069,6 +1142,26 @@ pub const Compiler = struct {
 
         if (self.cur.tag == .ident) {
             const name = self.cur.text;
+
+            // 1. Check if module access: Std.Math.tan() or Math.tan()
+            if (self.findModule(name)) |mod| {
+                if (mod == .std and self.peek.tag == .dot) {
+                    self.advance(); // past Std
+                    self.advance(); // past .
+                    if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "math") and self.peek.tag == .dot) {
+                        self.advance(); // past Math
+                        self.advance(); // past .
+                        try self.parseMathMember();
+                        return;
+                    }
+                } else if (mod == .math and self.peek.tag == .dot) {
+                    self.advance(); // past Math
+                    self.advance(); // past .
+                    try self.parseMathMember();
+                    return;
+                }
+            }
+
             self.advance();
 
             if (self.match(.l_paren)) {
@@ -1080,12 +1173,12 @@ pub const Compiler = struct {
                 }
                 _ = self.match(.r_paren);
 
-                if (findBuiltin(name)) |b| {
-                    const packed_arg: i64 = @as(i64, @intFromEnum(b.id)) | (@as(i64, arg_count) << 8);
-                    _ = try self.emit(.call_builtin, packed_arg);
-                } else if (self.findFunc(name)) |fidx| {
+                // User-defined function call only
+                if (self.findFunc(name)) |fidx| {
                     const func = self.funcs[fidx];
                     _ = try self.emit(.call, @intCast(func.entry_ip));
+                } else {
+                    _ = try self.emit(.push_0, 0);
                 }
                 return;
             }
@@ -1105,6 +1198,42 @@ pub const Compiler = struct {
         }
 
         _ = try self.emit(.push_0, 0);
+    }
+
+    fn parseMathMember(self: *Compiler) CompileError!void {
+        if (self.cur.tag != .ident) return error.SyntaxError;
+        const member = self.cur.text;
+        self.advance();
+
+        if (std.ascii.eqlIgnoreCase(member, "pi")) {
+            _ = try self.emit(.push_num, @bitCast(@as(f64, std.math.pi)));
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(member, "e")) {
+            _ = try self.emit(.push_num, @bitCast(@as(f64, std.math.e)));
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(member, "tau")) {
+            _ = try self.emit(.push_num, @bitCast(@as(f64, std.math.tau)));
+            return;
+        }
+
+        if (findBuiltin(member)) |b| {
+            _ = self.match(.l_paren);
+            var arg_count: u8 = 0;
+            while (self.cur.tag != .r_paren and self.cur.tag != .eof) {
+                try self.parseExpression();
+                arg_count += 1;
+                if (!self.match(.comma)) break;
+            }
+            _ = self.match(.r_paren);
+
+            const packed_arg: i64 = @as(i64, @intFromEnum(b.id)) | (@as(i64, arg_count) << 8);
+            _ = try self.emit(.call_builtin, packed_arg);
+            return;
+        }
+
+        return error.SyntaxError;
     }
 
     fn compileInterpolatedString(self: *Compiler, raw: []const u8) CompileError!void {
@@ -1151,6 +1280,8 @@ pub const Compiler = struct {
                 sub_c.state_count = self.state_count;
                 sub_c.host_tags = self.host_tags;
                 sub_c.host_tag_count = self.host_tag_count;
+                sub_c.modules = self.modules;
+                sub_c.module_count = self.module_count;
 
                 try sub_c.parseExpression();
 

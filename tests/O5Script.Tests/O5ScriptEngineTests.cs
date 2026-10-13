@@ -149,10 +149,24 @@ public class O5ScriptEngineTests {
     }
 
     [Fact]
-    public void MathBuiltins_WorkAccurately() {
-        string src = "pow(2, 4) + clamp(15, 0, 10) + lerp(0, 100, 0.5)";
+    public void MathBuiltins_WorkAccuratelyThroughModules() {
+        string src = """
+        con Std = @("std");
+        con Math = Std.Math;
+        Math.pow(2, 4) + Math.clamp(15, 0, 10) + Math.lerp(0, 100, 0.5)
+        """;
         double result = O5ScriptEngine.EvalNum(src);
         Assert.Equal(76.0, result);
+    }
+
+    [Fact]
+    public void Math_DirectSubmoduleImportAndConstants() {
+        string src = """
+        con Math = @("std.math");
+        Math.sin(0) + Math.pi
+        """;
+        double result = O5ScriptEngine.EvalNum(src);
+        Assert.Equal(Math.PI, result);
     }
 
     [Fact]
