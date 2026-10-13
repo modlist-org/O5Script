@@ -12,7 +12,7 @@ public enum TokenType {
     Sta,
     Con,
     If,
-    Fl,
+    Lf,
     El,
     Lop,
     Out,

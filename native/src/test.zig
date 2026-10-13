@@ -27,23 +27,24 @@ test "variables and blocks" {
     try std.testing.expectEqual(@as(f64, 30.0), res.num);
 }
 
-test "conditionals if fl el" {
+
+test "conditionals if lf el" {
     const allocator = std.testing.allocator;
     const src =
-        \\let x = 15;
-        \\if x < 10 {
-        \\    100
-        \\} fl x == 15 {
-        \\    200
+        \\let a = 100;
+        \\if a >= 200 {
+        \\    "eq 200 or ov 200"
+        \\} lf a >= 100 {
+        \\    "eq 100 or ov 100"
         \\} el {
-        \\    300
+        \\    "el"
         \\}
     ;
     const prog = try compiler.compileSource(src, allocator);
     defer prog.deinit();
 
     const res = try vm.run(prog, 0, &[_]f64{});
-    try std.testing.expectEqual(@as(f64, 200.0), res.num);
+    try std.testing.expectEqualStrings("eq 100 or ov 100", res.toSlice());
 }
 
 test "loops count and range" {
@@ -414,6 +415,61 @@ test "undefined function and argument mismatch errors" {
     try std.testing.expectError(error.UndefinedFunction, compiler.compileSource("non_existent(1)", allocator));
     try std.testing.expectError(error.ArgumentCountMismatch, compiler.compileSource("fun f(a, b) => a + b; f(1)", allocator));
 }
+
+test "loop with skp continue" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let sum = 0;
+        \\lop |i| 5 {
+        \\    if i == 2 {
+        \\        skp;
+        \\    }
+        \\    sum += i;
+        \\}
+        \\sum
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 0 + 1 + 3 + 4 = 8
+    try std.testing.expectEqual(@as(f64, 8.0), res.num);
+}
+
+test "array loop with skp continue" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let a = [10, 20, 30, 40];
+        \\let sum = 0;
+        \\lop |v| a {
+        \\    if v == 20 {
+        \\        skp;
+        \\    }
+        \\    sum += v;
+        \\}
+        \\sum
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 10 + 30 + 40 = 80
+    try std.testing.expectEqual(@as(f64, 80.0), res.num);
+}
+
+test "string interpolation with ternary and brace escaping" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let a = 1;
+        \\"val: {a > 0 ? 10 : 20}, literal: {{100}}"
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqualStrings("val: 10, literal: {100}", res.toSlice());
+}
+
 
 
 

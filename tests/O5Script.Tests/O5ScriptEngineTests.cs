@@ -30,13 +30,14 @@ public class O5ScriptEngineTests {
         Assert.Equal(40.0, result);
     }
 
+
     [Fact]
-    public void Conditionals_IfFlEl() {
+    public void Conditionals_IfLfEl() {
         string src = """
         let x = 15;
         if x < 10 {
             100
-        } fl x == 15 {
+        } lf x == 15 {
             200
         } el {
             300
@@ -61,7 +62,7 @@ public class O5ScriptEngineTests {
 
     [Fact]
     public void Loop_BreakAndContinue() {
-        string src = """
+        string srcBreak = """
         let sum = 0;
         lop |i| 100 {
             if i == 5 {
@@ -71,9 +72,21 @@ public class O5ScriptEngineTests {
         }
         sum
         """;
-        double result = O5ScriptEngine.EvalNum(src);
-        Assert.Equal(10.0, result);
+        Assert.Equal(10.0, O5ScriptEngine.EvalNum(srcBreak));
+
+        string srcContinue = """
+        let sum = 0;
+        lop |i| 5 {
+            if i == 2 {
+                skp;
+            }
+            sum += i;
+        }
+        sum
+        """;
+        Assert.Equal(8.0, O5ScriptEngine.EvalNum(srcContinue));
     }
+
 
     [Fact]
     public void PersistentState_RetainsAcrossEvaluations() {
@@ -110,10 +123,10 @@ public class O5ScriptEngineTests {
     public void StringInterpolation_FormatsNumbersAndTags() {
         string src = """
         let bpm = 180;
-        "Current BPM: {bpm}"
+        "Current BPM: {bpm}, Literal: {{bpm}}, Level: {bpm > 150 ? 1 : 0}"
         """;
         string result = O5ScriptEngine.EvalString(src);
-        Assert.Equal("Current BPM: 180", result);
+        Assert.Equal("Current BPM: 180, Literal: {bpm}, Level: 1", result);
     }
 
     [Fact]
@@ -249,4 +262,53 @@ public class O5ScriptEngineTests {
         """;
         Assert.Throws<InvalidOperationException>(() => O5ScriptEngine.Compile(badSrc));
     }
+
+    [Fact]
+    public void Array_Literal_Indexing_Length() {
+        double result = O5ScriptEngine.EvalNum("let a = [10, 20, 30]; a[1] + a.len");
+        Assert.Equal(23.0, result);
+    }
+
+    [Fact]
+    public void Array_Typed_Assignment() {
+        string src = """
+        let a: [3]num = [3]num{ 10, 20, 30 };
+        a[1] = 99;
+        a[1] += 1;
+        a[0] + a[1] + a[2]
+        """;
+        double result = O5ScriptEngine.EvalNum(src);
+        Assert.Equal(140.0, result);
+    }
+
+    [Fact]
+    public void Array_Loop() {
+        string src = """
+        let a = [1, 2, 3, 4, 5];
+        let sum = 0;
+        lop |v, i| a {
+            sum += v * i;
+        }
+        sum
+        """;
+        double result = O5ScriptEngine.EvalNum(src);
+        Assert.Equal(40.0, result);
+    }
+
+    [Fact]
+    public void Array_MultiDimensional() {
+        string src = """
+        let m = [[10, 20], [30, 40]];
+        m[1][0] + m[0][1] + m.len
+        """;
+        double result = O5ScriptEngine.EvalNum(src);
+        Assert.Equal(52.0, result);
+    }
+
+    [Fact]
+    public void Bitwise_Operators() {
+        double result = O5ScriptEngine.EvalNum("(5 & 3) + (4 | 2) + (10 ^ 6) + (1 << 3) + (16 >> 2)");
+        Assert.Equal(31.0, result);
+    }
 }
+

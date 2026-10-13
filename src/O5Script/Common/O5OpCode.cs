@@ -48,8 +48,6 @@ public enum O5OpCode : byte {
     JmpIfZero,
     JmpIfNotZero,
 
-    LoopStep,
-
     CallBuiltin,
     Call,
     Ret,

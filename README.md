@@ -9,7 +9,7 @@ Ultra-fast, zero-allocation, compiled scripting language designed for in-game HU
 - **Zero-Heap Core**: Fixed-size stack-allocated arrays (`[3]num`, `[2][2]num`) and bounded strings (`max_str_len = 256`, 16-byte Fat Pointers). 0 byte GC/heap overhead on evaluation hot paths.
 - **Turing-Complete**:
   - Loops: `lop 10`, `lop |i| 1..20`, `lop tru`, `lop |v, idx| arr`
-  - Branches: `if`, `fl` (else if), `el` (else), ternary `? :`
+  - Branches: `if`, `lf` (else if), `el` (else), ternary `? :`
   - Functions: Block functions with mandatory `ret` (`fun f(a, b): num { ret a + b; }`), lambdas (`fun sq(x) => x * x;`), and recursion.
 - **Tag Direct Binding**:
   - Function delegate: `tag Name => Func;`

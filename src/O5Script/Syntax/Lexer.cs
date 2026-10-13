@@ -107,7 +107,10 @@ public sealed class Lexer {
                     break;
                 case '.':
                     if (Match('.')) tokens.Add(new Token(TokenType.DotDot, "..", start, 2));
-                    else tokens.Add(new Token(TokenType.Eof, ".", start, 1));
+                    else tokens.Add(new Token(TokenType.Dot, ".", start, 1));
+                    break;
+                case '@':
+                    tokens.Add(new Token(TokenType.At, "@", start, 1));
                     break;
                 case '?':
                     tokens.Add(new Token(TokenType.Question, "?", start, 1));
@@ -259,7 +262,7 @@ public sealed class Lexer {
             "sta" => TokenType.Sta,
             "con" => TokenType.Con,
             "if" => TokenType.If,
-            "fl" => TokenType.Fl,
+            "lf" => TokenType.Lf,
             "el" => TokenType.El,
             "lop" => TokenType.Lop,
             "out" => TokenType.Out,

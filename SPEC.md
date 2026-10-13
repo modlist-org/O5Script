@@ -26,7 +26,7 @@ O5Script is an ultra-fast, zero-allocation, Turing-complete compiled scripting l
 
 ### Conditionals
 - `if <cond> { ... }`: Conditional branch.
-- `fl <cond> { ... }`: Else-if branch.
+- `lf <cond> { ... }`: Else-if branch.
 - `el { ... }`: Else branch.
 - Ternary operator: `<cond> ? <then_expr> : <else_expr>`.
 

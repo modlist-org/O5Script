@@ -51,7 +51,7 @@ pub const TokenType = enum {
     kw_sta,
     kw_con,
     kw_if,
-    kw_fl,
+    kw_lf,
     kw_el,
     kw_lop,
     kw_out,
@@ -213,7 +213,7 @@ pub const Lexer = struct {
                 else if (std.mem.eql(u8, ident, "sta")) TokenType.kw_sta
                 else if (std.mem.eql(u8, ident, "con")) TokenType.kw_con
                 else if (std.mem.eql(u8, ident, "if")) TokenType.kw_if
-                else if (std.mem.eql(u8, ident, "fl")) TokenType.kw_fl
+                else if (std.mem.eql(u8, ident, "lf")) TokenType.kw_lf
                 else if (std.mem.eql(u8, ident, "el")) TokenType.kw_el
                 else if (std.mem.eql(u8, ident, "lop")) TokenType.kw_lop
                 else if (std.mem.eql(u8, ident, "out")) TokenType.kw_out
@@ -317,10 +317,13 @@ pub const Lexer = struct {
 };
 
 const LoopContext = struct {
-    continue_ip: usize,
+    continue_ip: usize = 0,
     breaks: [max_breaks]usize = undefined,
     break_count: usize = 0,
+    continues: [max_breaks]usize = undefined,
+    continue_count: usize = 0,
 };
+
 
 pub const Compiler = struct {
     lexer: Lexer,
@@ -449,6 +452,46 @@ pub const Compiler = struct {
         if (offset + len > self.string_bytes.len) return error.StringPoolOverflow;
         @memcpy(self.string_bytes[offset .. offset + len], text);
         self.string_len += len;
+        const packed_val: u64 = @as(u64, @intCast(offset)) | (@as(u64, @intCast(len)) << 32);
+        return @bitCast(packed_val);
+    }
+
+    fn addStringUnescaped(self: *Compiler, text: []const u8) CompileError!i64 {
+        const offset = self.string_len;
+        var write_pos = offset;
+        var i: usize = 0;
+        while (i < text.len) {
+            if (write_pos - offset >= types.max_str_len) return error.StringLiteralTooLong;
+            if (write_pos >= self.string_bytes.len) return error.StringPoolOverflow;
+            if (text[i] == '{' and i + 1 < text.len and text[i + 1] == '{') {
+                self.string_bytes[write_pos] = '{';
+                write_pos += 1;
+                i += 2;
+            } else if (text[i] == '}' and i + 1 < text.len and text[i + 1] == '}') {
+                self.string_bytes[write_pos] = '}';
+                write_pos += 1;
+                i += 2;
+            } else if (text[i] == '\\' and i + 1 < text.len) {
+                const esc = text[i + 1];
+                const ch: u8 = switch (esc) {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '\\' => '\\',
+                    '"' => '"',
+                    else => esc,
+                };
+                self.string_bytes[write_pos] = ch;
+                write_pos += 1;
+                i += 2;
+            } else {
+                self.string_bytes[write_pos] = text[i];
+                write_pos += 1;
+                i += 1;
+            }
+        }
+        const len = write_pos - offset;
+        self.string_len = write_pos;
         const packed_val: u64 = @as(u64, @intCast(offset)) | (@as(u64, @intCast(len)) << 32);
         return @bitCast(packed_val);
     }
@@ -979,8 +1022,12 @@ pub const Compiler = struct {
 
         if (self.match(.kw_skp)) {
             if (self.loop_depth > 0) {
-                const loop = self.loops[self.loop_depth - 1];
-                _ = try self.emit(.jmp, @intCast(loop.continue_ip));
+                const jmp_idx = try self.emit(.jmp, 0);
+                var loop = &self.loops[self.loop_depth - 1];
+                if (loop.continue_count < max_breaks) {
+                    loop.continues[loop.continue_count] = jmp_idx;
+                    loop.continue_count += 1;
+                }
             }
             _ = self.match(.semicolon);
             return;
@@ -1241,7 +1288,7 @@ pub const Compiler = struct {
         end_jumps[end_jump_count] = exit_jmp;
         end_jump_count += 1;
 
-        while (self.match(.kw_fl)) {
+        while (self.match(.kw_lf)) {
             try self.parseExpression();
             const next_false = try self.emit(.jmp_if_zero, 0);
             try self.parseBlock();
@@ -1290,7 +1337,7 @@ pub const Compiler = struct {
             _ = try self.emit(.store_local, @intCast(idx_slot));
 
             const loop_start_ip = self.op_count;
-            self.loops[self.loop_depth] = .{ .continue_ip = loop_start_ip };
+            self.loops[self.loop_depth] = .{ .continue_ip = loop_start_ip, .break_count = 0, .continue_count = 0 };
             self.loop_depth += 1;
 
             _ = try self.emit(.load_local, @intCast(idx_slot));
@@ -1309,7 +1356,10 @@ pub const Compiler = struct {
             try self.parseBlock();
 
             const continue_ip = self.op_count;
-            self.loops[self.loop_depth - 1].continue_ip = continue_ip;
+            const current_loop = self.loops[self.loop_depth - 1];
+            for (current_loop.continues[0..current_loop.continue_count]) |cnt_jmp| {
+                self.patchJump(cnt_jmp, continue_ip);
+            }
 
             _ = try self.emit(.load_local, @intCast(idx_slot));
             _ = try self.emit(.push_1, 0);
@@ -1321,7 +1371,6 @@ pub const Compiler = struct {
             self.patchJump(exit_cond_jmp, loop_end_ip);
 
             self.loop_depth -= 1;
-            const current_loop = self.loops[self.loop_depth];
             for (current_loop.breaks[0..current_loop.break_count]) |brk_jmp| {
                 self.patchJump(brk_jmp, loop_end_ip);
             }
@@ -1357,7 +1406,7 @@ pub const Compiler = struct {
         }
 
         const loop_start_ip = self.op_count;
-        const loop_ctx = LoopContext{ .continue_ip = loop_start_ip };
+        const loop_ctx = LoopContext{ .continue_ip = loop_start_ip, .break_count = 0, .continue_count = 0 };
         self.loops[self.loop_depth] = loop_ctx;
         self.loop_depth += 1;
 
@@ -1372,8 +1421,11 @@ pub const Compiler = struct {
 
         try self.parseBlock();
 
-        const continue_ip = self.op_count;
-        self.loops[self.loop_depth - 1].continue_ip = continue_ip;
+        const continue_ip = if (is_infinite) loop_start_ip else self.op_count;
+        const current_loop = self.loops[self.loop_depth - 1];
+        for (current_loop.continues[0..current_loop.continue_count]) |cnt_jmp| {
+            self.patchJump(cnt_jmp, continue_ip);
+        }
 
         if (!is_infinite) {
             const vslot = loop_var_slot.?;
@@ -1391,7 +1443,6 @@ pub const Compiler = struct {
         }
 
         self.loop_depth -= 1;
-        const current_loop = self.loops[self.loop_depth];
         for (current_loop.breaks[0..current_loop.break_count]) |brk_jmp| {
             self.patchJump(brk_jmp, loop_end_ip);
         }
@@ -1743,7 +1794,7 @@ pub const Compiler = struct {
 
                 if (i > seg_start) {
                     const s = content[seg_start..i];
-                    const str_arg = try self.addString(s);
+                    const str_arg = try self.addStringUnescaped(s);
                     _ = try self.emit(.push_str, str_arg);
                     if (parts > 0) _ = try self.emit(.add, 0);
                     parts += 1;
@@ -1752,16 +1803,47 @@ pub const Compiler = struct {
                 i += 1;
                 const expr_start = i;
                 var depth: usize = 1;
+                var in_expr_str = false;
                 while (i < content.len and depth > 0) {
-                    if (content[i] == '{') depth += 1;
-                    if (content[i] == '}') depth -= 1;
+                    if (content[i] == '\\' and i + 1 < content.len and content[i + 1] == '"') {
+                        i += 2;
+                        continue;
+                    }
+                    if (content[i] == '"') {
+                        in_expr_str = !in_expr_str;
+                    } else if (!in_expr_str) {
+                        if (content[i] == '{') depth += 1;
+                        if (content[i] == '}') depth -= 1;
+                    }
                     if (depth > 0) i += 1;
                 }
-                const expr_src = content[expr_start..i];
+                const expr_raw = content[expr_start..i];
                 if (i < content.len) i += 1;
                 seg_start = i;
 
+                var expr_buf: [256]u8 = undefined;
+                var expr_len: usize = 0;
+                var ei: usize = 0;
+                while (ei < expr_raw.len) {
+                    if (expr_raw[ei] == '\\' and ei + 1 < expr_raw.len and expr_raw[ei + 1] == '"') {
+                        if (expr_len < expr_buf.len) {
+                            expr_buf[expr_len] = '"';
+                            expr_len += 1;
+                        }
+                        ei += 2;
+                    } else {
+                        if (expr_len < expr_buf.len) {
+                            expr_buf[expr_len] = expr_raw[ei];
+                            expr_len += 1;
+                        }
+                        ei += 1;
+                    }
+                }
+                const expr_src = expr_buf[0..expr_len];
+
                 var sub_c = Compiler.init(expr_src, self.allocator);
+                sub_c.string_bytes = self.string_bytes;
+                sub_c.string_len = self.string_len;
                 sub_c.locals = self.locals;
                 sub_c.local_count = self.local_count;
                 sub_c.states = self.states;
@@ -1776,6 +1858,8 @@ pub const Compiler = struct {
                 sub_c.array_count = self.array_count;
 
                 try sub_c.parseExpression();
+                self.string_bytes = sub_c.string_bytes;
+                self.string_len = sub_c.string_len;
 
                 const base_op = self.op_count;
                 for (sub_c.ops[0..sub_c.op_count]) |op| {
@@ -1783,6 +1867,8 @@ pub const Compiler = struct {
                         const hname = sub_c.host_tags[@intCast(op.arg)];
                         const hidx = try self.getOrAddHostTag(hname);
                         _ = try self.emit(.load_host, @intCast(hidx));
+                    } else if (op.code == .jmp or op.code == .jmp_if_zero or op.code == .jmp_if_nonzero) {
+                        _ = try self.emit(op.code, op.arg + @as(i64, @intCast(base_op)));
                     } else {
                         _ = try self.emit(op.code, op.arg);
                     }
@@ -1816,7 +1902,7 @@ pub const Compiler = struct {
 
         if (seg_start < content.len or parts == 0) {
             const s = content[seg_start..content.len];
-            const str_arg = try self.addString(s);
+            const str_arg = try self.addStringUnescaped(s);
             _ = try self.emit(.push_str, str_arg);
             if (parts > 0) _ = try self.emit(.add, 0);
         }
