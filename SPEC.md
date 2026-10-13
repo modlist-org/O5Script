@@ -97,6 +97,12 @@ Registers tags directly for the Overlayer engine:
 
 ## 5. Strings & Interpolation
 
+- **Bounded Length (Zero-Heap)**:
+  - Strings are strictly non-heap, bounded by a compile-time and runtime limit of 256 bytes (`max_str_len = 256`).
+  - Literal strings exceeding 256 bytes fail with compile error `StringLiteralTooLong`.
+  - Dynamic string concatenation exceeding 256 bytes fails with runtime error `StringTooLong`.
+- **Host Tag Strings**:
+  - Host strings (e.g. `#SongTitle`, `#Artist`) are passed as zero-copy 16-byte Fat Pointers (`str_ptr` + `str_len`). Zero allocations, zero copies, O(1) pointer reference.
 - String concatenation with `+` is supported (`"BPM: " + #CurBpm`).
 - Embedded string interpolation:
   ```o5s
@@ -145,4 +151,57 @@ O5Script has **no global built-in functions** to prevent scope pollution and mai
 ### `Std.Math` Functions & Constants
 - Functions: `Math.sin(x)`, `Math.cos(x)`, `Math.tan(x)`, `Math.asin(x)`, `Math.acos(x)`, `Math.atan(x)`, `Math.atan2(y, x)`, `Math.sqrt(x)`, `Math.abs(x)`, `Math.floor(x)`, `Math.ceil(x)`, `Math.round(x)`, `Math.min(a, b)`, `Math.max(a, b)`, `Math.clamp(v, min, max)`, `Math.lerp(a, b, t)`, `Math.pow(a, b)`, `Math.log(x)`, `Math.exp(x)`
 - Constants (compile-time folded): `Math.pi`, `Math.e`, `Math.tau`
+
+---
+
+## 8. Fixed-Size Arrays (Zig-Style)
+
+Arrays are allocated purely as contiguous stack slots in the VM frame with zero heap allocation. Dynamic resizing (`push`/`pop`) is prohibited by design.
+
+### Array Declaration & Types
+- Type annotations: `[N]num`, `[N]str`, multi-dimensional `[N][M]num`.
+- Untyped literal (type-inferred):
+  ```o5s
+  let a = [10, 20, 30];
+  let m = [[1, 2], [3, 4]];
+  ```
+- Zig-style typed literal:
+  ```o5s
+  let a: [3]num = [3]num{ 10, 20, 30 };
+  let m = [2][2]num{ [1, 2], [3, 4] };
+  ```
+
+### Indexing & Mutation
+- Zero-based indexing: `a[0]`, `m[1][0]`.
+- Element assignment & compound operators:
+  ```o5s
+  a[1] = 99;
+  a[1] += 1;
+  ```
+- **Bounds Checking**:
+  - Static out-of-bounds index: compile error (`IndexOutOfBounds`).
+  - Dynamic out-of-bounds index: runtime error (`OutOfBounds` trap).
+
+### Length Property (`.len`)
+- Compile-time folded zero-cost length access:
+  ```o5s
+  let len = a.len;       // 3
+  let rows = m.len;      // 2
+  ```
+
+### Array Iteration (`lop`)
+- Iterating values:
+  ```o5s
+  let sum = 0;
+  lop |v| a {
+      sum += v;
+  }
+  ```
+- Iterating with value and index:
+  ```o5s
+  let sum = 0;
+  lop |v, i| a {
+      sum += v * i;
+  }
+  ```
 

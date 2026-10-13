@@ -127,6 +127,12 @@ public sealed class Lexer {
                 case '}':
                     tokens.Add(new Token(TokenType.RBrace, "}", start, 1));
                     break;
+                case '[':
+                    tokens.Add(new Token(TokenType.LBracket, "[", start, 1));
+                    break;
+                case ']':
+                    tokens.Add(new Token(TokenType.RBracket, "]", start, 1));
+                    break;
                 case ',':
                     tokens.Add(new Token(TokenType.Comma, ",", start, 1));
                     break;

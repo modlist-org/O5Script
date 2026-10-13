@@ -22,10 +22,17 @@ pub const CompileError = error{
     OutOfOps,
     OutOfMemory,
     StringPoolOverflow,
+    StringLiteralTooLong,
     TooManyHostTags,
     TooManyLocals,
     TooManyStates,
     SyntaxError,
+    IndexOutOfBounds,
+    ExpectedArrayDimension,
+    ExpectedClosingBracket,
+    TooManyDimensions,
+    DimensionMismatch,
+    ArraySizeMismatch,
 };
 
 pub const TokenType = enum {
@@ -90,6 +97,8 @@ pub const TokenType = enum {
     r_paren,
     l_brace,
     r_brace,
+    l_bracket,
+    r_bracket,
     comma,
     semicolon,
 };
@@ -284,6 +293,8 @@ pub const Lexer = struct {
             ')' => return .{ .tag = .r_paren, .text = ")" },
             '{' => return .{ .tag = .l_brace, .text = "{" },
             '}' => return .{ .tag = .r_brace, .text = "}" },
+            '[' => return .{ .tag = .l_bracket, .text = "[" },
+            ']' => return .{ .tag = .r_bracket, .text = "]" },
             ',' => return .{ .tag = .comma, .text = "," },
             ';' => return .{ .tag = .semicolon, .text = ";" },
             else => return .{ .tag = .eof, .text = "" },
@@ -337,8 +348,33 @@ pub const Compiler = struct {
 
     loops: [max_loops]LoopContext = undefined,
     loop_depth: usize = 0,
+    arrays: [64]ArrayVar = undefined,
+    array_count: usize = 0,
 
     allocator: std.mem.Allocator,
+
+    pub const ArrayInfo = struct {
+        dims: [4]u32 = [_]u32{ 0, 0, 0, 0 },
+        dim_count: u8 = 0,
+        total_elements: u32 = 0,
+        is_state: bool = false,
+        base_slot: usize = 0,
+
+        pub fn stride(self: ArrayInfo, dim_idx: usize) u32 {
+            var s: u32 = 1;
+            var i = self.dim_count;
+            while (i > dim_idx + 1) {
+                i -= 1;
+                s *= self.dims[i];
+            }
+            return s;
+        }
+    };
+
+    pub const ArrayVar = struct {
+        name: []const u8,
+        info: ArrayInfo,
+    };
 
     pub const ModuleKind = enum {
         std,
@@ -357,6 +393,7 @@ pub const Compiler = struct {
             .peek = undefined,
             .allocator = allocator,
             .module_count = 0,
+            .array_count = 0,
         };
         c.cur = c.lexer.nextToken();
         c.peek = c.lexer.nextToken();
@@ -389,6 +426,7 @@ pub const Compiler = struct {
     }
 
     fn addString(self: *Compiler, text: []const u8) CompileError!i64 {
+        if (text.len > types.max_str_len) return error.StringLiteralTooLong;
         const offset = self.string_len;
         const len = text.len;
         if (offset + len > self.string_bytes.len) return error.StringPoolOverflow;
@@ -440,6 +478,23 @@ pub const Compiler = struct {
         self.state_inits[idx] = Value.fromNum(0.0);
         self.state_count += 1;
         return idx;
+    }
+
+    fn findArray(self: *Compiler, name: []const u8) ?ArrayInfo {
+        var i = self.array_count;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.arrays[i].name, name)) {
+                return self.arrays[i].info;
+            }
+        }
+        return null;
+    }
+
+    fn addArray(self: *Compiler, name: []const u8, info: ArrayInfo) CompileError!void {
+        if (self.array_count >= 64) return error.TooManyLocals;
+        self.arrays[self.array_count] = .{ .name = name, .info = info };
+        self.array_count += 1;
     }
 
     fn findFunc(self: *Compiler, name: []const u8) ?usize {
@@ -543,11 +598,167 @@ pub const Compiler = struct {
         return prog;
     }
 
-    fn skipTypeAnnotation(self: *Compiler) void {
-        if (self.match(.colon)) {
-            if (self.cur.tag == .ident) {
-                self.advance();
+    fn parseTypeAnnotation(self: *Compiler) CompileError!?ArrayInfo {
+        if (!self.match(.colon)) return null;
+        var info = ArrayInfo{};
+        while (self.match(.l_bracket)) {
+            if (self.cur.tag != .number) return error.ExpectedArrayDimension;
+            const dim: u32 = @intFromFloat(self.cur.num_val);
+            self.advance();
+            if (!self.match(.r_bracket)) return error.ExpectedClosingBracket;
+            if (info.dim_count >= 4) return error.TooManyDimensions;
+            info.dims[info.dim_count] = dim;
+            info.dim_count += 1;
+        }
+        if (self.cur.tag == .ident) {
+            self.advance();
+        }
+        if (info.dim_count > 0) {
+            var total: u32 = 1;
+            for (info.dims[0..info.dim_count]) |d| {
+                total *= d;
             }
+            info.total_elements = total;
+            return info;
+        }
+        return null;
+    }
+
+    fn skipTypeAnnotation(self: *Compiler) void {
+        _ = self.parseTypeAnnotation() catch {};
+    }
+
+    fn isTypedArrayHeader(self: *Compiler) bool {
+        if (self.cur.tag != .l_bracket) return false;
+        const saved_pos = self.lexer.pos;
+        const saved_cur = self.cur;
+        const saved_peek = self.peek;
+
+        var matched = false;
+        if (self.cur.tag == .l_bracket and self.peek.tag == .number) {
+            self.advance();
+            self.advance();
+            if (self.cur.tag == .r_bracket) {
+                self.advance();
+                while (self.cur.tag == .l_bracket and self.peek.tag == .number) {
+                    self.advance();
+                    self.advance();
+                    if (self.cur.tag == .r_bracket) {
+                        self.advance();
+                    } else break;
+                }
+                if (self.cur.tag == .ident and self.peek.tag == .l_brace) {
+                    matched = true;
+                }
+            }
+        }
+
+        self.lexer.pos = saved_pos;
+        self.cur = saved_cur;
+        self.peek = saved_peek;
+        return matched;
+    }
+
+    fn parseArrayLiteral(self: *Compiler, info: *ArrayInfo) CompileError!void {
+        const is_typed = self.isTypedArrayHeader();
+        if (is_typed) {
+            var dim_idx: usize = 0;
+            while (self.match(.l_bracket)) {
+                if (self.cur.tag != .number) return error.ExpectedArrayDimension;
+                const d: u32 = @intFromFloat(self.cur.num_val);
+                self.advance();
+                if (!self.match(.r_bracket)) return error.ExpectedClosingBracket;
+                if (dim_idx >= 4) return error.TooManyDimensions;
+                info.dims[dim_idx] = d;
+                dim_idx += 1;
+            }
+            info.dim_count = @intCast(dim_idx);
+            if (self.cur.tag == .ident) self.advance();
+
+            var total: u32 = 1;
+            for (info.dims[0..info.dim_count]) |d| {
+                total *= d;
+            }
+            info.total_elements = total;
+
+            var flat_idx: usize = 0;
+            try self.parseArrayElements(info, 0, &flat_idx, true);
+        } else {
+            var flat_idx: usize = 0;
+            try self.parseArrayElements(info, 0, &flat_idx, false);
+            if (info.dim_count == 0) info.dim_count = 1;
+            info.total_elements = @intCast(flat_idx);
+        }
+    }
+
+    fn parseArrayElements(
+        self: *Compiler,
+        info: *ArrayInfo,
+        current_dim: usize,
+        flat_idx: *usize,
+        is_typed: bool,
+    ) CompileError!void {
+        const opening: TokenType = if (is_typed and current_dim == 0) .l_brace else .l_bracket;
+        const closing: TokenType = if (is_typed and current_dim == 0) .r_brace else .r_bracket;
+
+        if (!self.match(opening)) return error.SyntaxError;
+
+        var count: u32 = 0;
+        while (self.cur.tag != closing and self.cur.tag != .eof) {
+            if (self.cur.tag == .l_bracket and (info.dim_count == 0 or current_dim + 1 < info.dim_count)) {
+                if (info.dim_count == 0) info.dim_count = @intCast(current_dim + 2);
+                try self.parseArrayElements(info, current_dim + 1, flat_idx, false);
+            } else {
+                try self.parseExpression();
+                const slot = if (info.is_state) try self.addState("") else try self.addLocal("");
+                _ = try self.emit(if (info.is_state) .store_state else .store_local, @intCast(slot));
+                flat_idx.* += 1;
+            }
+            count += 1;
+            if (!self.match(.comma)) break;
+        }
+
+        if (!self.match(closing)) return error.ExpectedClosingBracket;
+
+        if (info.dims[current_dim] == 0) {
+            info.dims[current_dim] = count;
+        } else if (info.dims[current_dim] != count) {
+            return error.ArraySizeMismatch;
+        }
+    }
+
+    fn emitArrayIndexing(self: *Compiler, arr: ArrayInfo) CompileError!void {
+        var dim_idx: usize = 0;
+        while (self.match(.l_bracket)) {
+            if (dim_idx >= arr.dim_count) return error.TooManyDimensions;
+            const bound = arr.dims[dim_idx];
+
+            if (self.cur.tag == .number and self.peek.tag == .r_bracket) {
+                const idx_num = self.cur.num_val;
+                if (idx_num < 0 or idx_num >= @as(f64, @floatFromInt(bound))) {
+                    return error.IndexOutOfBounds;
+                }
+            }
+
+            try self.parseExpression();
+            _ = try self.emit(.check_bounds, @intCast(bound));
+            if (!self.match(.r_bracket)) return error.ExpectedClosingBracket;
+
+            if (dim_idx == 0 and arr.dim_count > 1) {
+                const stride = arr.stride(dim_idx);
+                _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(stride))));
+                _ = try self.emit(.mul, 0);
+            } else if (dim_idx > 0) {
+                _ = try self.emit(.add, 0);
+            }
+            dim_idx += 1;
+            if (self.cur.tag != .l_bracket) break;
+        }
+
+        if (arr.is_state) {
+            _ = try self.emit(.load_state_elem, @intCast(arr.base_slot));
+        } else {
+            _ = try self.emit(.load_local_elem, @intCast(arr.base_slot));
         }
     }
 
@@ -555,10 +766,32 @@ pub const Compiler = struct {
         if (self.match(.kw_let)) {
             const name = self.cur.text;
             self.advance();
-            self.skipTypeAnnotation();
+            const type_arr = try self.parseTypeAnnotation();
             if (self.match(.equal)) {
+                if (self.cur.tag == .l_bracket) {
+                    var arr_info = type_arr orelse ArrayInfo{};
+                    arr_info.base_slot = self.local_count;
+                    arr_info.is_state = false;
+                    try self.parseArrayLiteral(&arr_info);
+                    try self.addArray(name, arr_info);
+                    _ = self.match(.semicolon);
+                    return;
+                }
                 try self.parseExpression();
             } else {
+                if (type_arr) |t_arr| {
+                    var arr_info = t_arr;
+                    arr_info.base_slot = self.local_count;
+                    arr_info.is_state = false;
+                    for (0..arr_info.total_elements) |_| {
+                        const s = try self.addLocal("");
+                        _ = try self.emit(.push_0, 0);
+                        _ = try self.emit(.store_local, @intCast(s));
+                    }
+                    try self.addArray(name, arr_info);
+                    _ = self.match(.semicolon);
+                    return;
+                }
                 _ = try self.emit(.push_0, 0);
             }
             const slot = try self.addLocal(name);
@@ -570,21 +803,37 @@ pub const Compiler = struct {
         if (self.match(.kw_sta)) {
             const name = self.cur.text;
             self.advance();
-            self.skipTypeAnnotation();
-            var init_val: f64 = 0.0;
+            const type_arr = try self.parseTypeAnnotation();
             if (self.match(.equal)) {
+                if (self.cur.tag == .l_bracket) {
+                    var arr_info = type_arr orelse ArrayInfo{};
+                    arr_info.base_slot = self.state_count;
+                    arr_info.is_state = true;
+                    try self.parseArrayLiteral(&arr_info);
+                    try self.addArray(name, arr_info);
+                    _ = self.match(.semicolon);
+                    return;
+                }
                 if (self.cur.tag == .number) {
-                    init_val = self.cur.num_val;
+                    const init_val = self.cur.num_val;
                     self.advance();
+                    const slot = try self.addState(name);
+                    self.state_inits[slot] = Value.fromNum(init_val);
+                    _ = self.match(.semicolon);
+                    return;
                 } else if (self.match(.minus) and self.cur.tag == .number) {
-                    init_val = -self.cur.num_val;
+                    const init_val = -self.cur.num_val;
                     self.advance();
+                    const slot = try self.addState(name);
+                    self.state_inits[slot] = Value.fromNum(init_val);
+                    _ = self.match(.semicolon);
+                    return;
                 } else {
                     try self.parseExpression();
                 }
             }
             const slot = try self.addState(name);
-            self.state_inits[slot] = Value.fromNum(init_val);
+            self.state_inits[slot] = Value.fromNum(0.0);
             _ = self.match(.semicolon);
             return;
         }
@@ -759,6 +1008,83 @@ pub const Compiler = struct {
             return;
         }
 
+        if (self.cur.tag == .ident and self.peek.tag == .l_bracket) {
+            const saved_pos = self.lexer.pos;
+            const saved_cur = self.cur;
+            const saved_peek = self.peek;
+            const saved_op_count = self.op_count;
+
+            const name = self.cur.text;
+            if (self.findArray(name)) |arr| {
+                self.advance();
+                var dim_idx: usize = 0;
+                var ok = true;
+                while (self.match(.l_bracket)) {
+                    if (dim_idx >= arr.dim_count) { ok = false; break; }
+                    const bound = arr.dims[dim_idx];
+                    if (self.cur.tag == .number and self.peek.tag == .r_bracket) {
+                        const idx_num = self.cur.num_val;
+                        if (idx_num < 0 or idx_num >= @as(f64, @floatFromInt(bound))) {
+                            return error.IndexOutOfBounds;
+                        }
+                    }
+                    try self.parseExpression();
+                    _ = try self.emit(.check_bounds, @intCast(bound));
+                    if (!self.match(.r_bracket)) { ok = false; break; }
+
+                    if (dim_idx == 0 and arr.dim_count > 1) {
+                        const stride = arr.stride(dim_idx);
+                        _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(stride))));
+                        _ = try self.emit(.mul, 0);
+                    } else if (dim_idx > 0) {
+                        _ = try self.emit(.add, 0);
+                    }
+                    dim_idx += 1;
+                    if (self.cur.tag != .l_bracket) break;
+                }
+
+                const op_tok = self.cur.tag;
+                if (ok and dim_idx == arr.dim_count and (op_tok == .equal or op_tok == .plus_equal or op_tok == .minus_equal or op_tok == .star_equal or op_tok == .slash_equal)) {
+                    self.advance();
+                    if (op_tok == .equal) {
+                        try self.parseExpression();
+                        if (arr.is_state) {
+                            _ = try self.emit(.store_state_elem, @intCast(arr.base_slot));
+                        } else {
+                            _ = try self.emit(.store_local_elem, @intCast(arr.base_slot));
+                        }
+                    } else {
+                        _ = try self.emit(.dup, 0);
+                        if (arr.is_state) {
+                            _ = try self.emit(.load_state_elem, @intCast(arr.base_slot));
+                        } else {
+                            _ = try self.emit(.load_local_elem, @intCast(arr.base_slot));
+                        }
+                        try self.parseExpression();
+                        switch (op_tok) {
+                            .plus_equal => _ = try self.emit(.add, 0),
+                            .minus_equal => _ = try self.emit(.sub, 0),
+                            .star_equal => _ = try self.emit(.mul, 0),
+                            .slash_equal => _ = try self.emit(.div, 0),
+                            else => {},
+                        }
+                        if (arr.is_state) {
+                            _ = try self.emit(.store_state_elem, @intCast(arr.base_slot));
+                        } else {
+                            _ = try self.emit(.store_local_elem, @intCast(arr.base_slot));
+                        }
+                    }
+                    _ = self.match(.semicolon);
+                    return;
+                } else {
+                    self.op_count = saved_op_count;
+                    self.lexer.pos = saved_pos;
+                    self.cur = saved_cur;
+                    self.peek = saved_peek;
+                }
+            }
+        }
+
         if (self.cur.tag == .ident and (self.peek.tag == .equal or self.peek.tag == .plus_equal or self.peek.tag == .minus_equal or self.peek.tag == .star_equal or self.peek.tag == .slash_equal)) {
             const name = self.cur.text;
             self.advance();
@@ -853,14 +1179,73 @@ pub const Compiler = struct {
     }
 
     fn parseLoop(self: *Compiler) CompileError!void {
-        var loop_var_slot: ?usize = null;
+        var var1_name: ?[]const u8 = null;
+        var var2_name: ?[]const u8 = null;
         if (self.match(.pipe)) {
-            const var_name = self.cur.text;
+            var1_name = self.cur.text;
             self.advance();
+            if (self.match(.comma)) {
+                var2_name = self.cur.text;
+                self.advance();
+            }
             _ = self.match(.pipe);
-            loop_var_slot = try self.addLocal(var_name);
         }
 
+        if (var1_name != null and self.cur.tag == .ident and self.findArray(self.cur.text) != null and self.peek.tag == .l_brace) {
+            const arr_name = self.cur.text;
+            const arr = self.findArray(arr_name).?;
+            self.advance();
+
+            const N = arr.dims[0];
+            const v_name = var1_name.?;
+            const idx_name = var2_name;
+
+            const idx_slot = if (idx_name) |n| (try self.addLocal(n)) else (try self.addLocal(""));
+            const v_slot = try self.addLocal(v_name);
+
+            _ = try self.emit(.push_0, 0);
+            _ = try self.emit(.store_local, @intCast(idx_slot));
+
+            const loop_start_ip = self.op_count;
+            self.loops[self.loop_depth] = .{ .continue_ip = loop_start_ip };
+            self.loop_depth += 1;
+
+            _ = try self.emit(.load_local, @intCast(idx_slot));
+            _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(N))));
+            _ = try self.emit(.lt, 0);
+            const exit_cond_jmp = try self.emit(.jmp_if_zero, 0);
+
+            _ = try self.emit(.load_local, @intCast(idx_slot));
+            if (arr.is_state) {
+                _ = try self.emit(.load_state_elem, @intCast(arr.base_slot));
+            } else {
+                _ = try self.emit(.load_local_elem, @intCast(arr.base_slot));
+            }
+            _ = try self.emit(.store_local, @intCast(v_slot));
+
+            try self.parseBlock();
+
+            const continue_ip = self.op_count;
+            self.loops[self.loop_depth - 1].continue_ip = continue_ip;
+
+            _ = try self.emit(.load_local, @intCast(idx_slot));
+            _ = try self.emit(.push_1, 0);
+            _ = try self.emit(.add, 0);
+            _ = try self.emit(.store_local, @intCast(idx_slot));
+
+            _ = try self.emit(.jmp, @intCast(loop_start_ip));
+            const loop_end_ip = self.op_count;
+            self.patchJump(exit_cond_jmp, loop_end_ip);
+
+            self.loop_depth -= 1;
+            const current_loop = self.loops[self.loop_depth];
+            for (current_loop.breaks[0..current_loop.break_count]) |brk_jmp| {
+                self.patchJump(brk_jmp, loop_end_ip);
+            }
+            return;
+        }
+
+        var loop_var_slot: ?usize = if (var1_name) |n| (try self.addLocal(n)) else null;
         var is_infinite = false;
         var is_range = false;
         var limit_slot: usize = 0;
@@ -1130,8 +1515,45 @@ pub const Compiler = struct {
             return;
         }
 
+        if (self.cur.tag == .l_bracket) {
+            var arr_info = ArrayInfo{};
+            arr_info.base_slot = self.local_count;
+            arr_info.is_state = false;
+            try self.parseArrayLiteral(&arr_info);
+            if (self.cur.tag == .l_bracket) {
+                try self.emitArrayIndexing(arr_info);
+                return;
+            }
+            _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(arr_info.dims[0]))));
+            return;
+        }
+
         if (self.cur.tag == .ident) {
             const name = self.cur.text;
+
+            if (self.findArray(name)) |arr| {
+                if (self.peek.tag == .dot) {
+                    self.advance();
+                    self.advance();
+                    if (self.cur.tag == .ident and std.mem.eql(u8, self.cur.text, "len")) {
+                        self.advance();
+                        _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(arr.dims[0]))));
+                        return;
+                    }
+                }
+                if (self.peek.tag == .l_bracket) {
+                    self.advance();
+                    try self.emitArrayIndexing(arr);
+                    if (self.match(.dot)) {
+                        if (self.cur.tag == .ident and std.mem.eql(u8, self.cur.text, "len")) {
+                            self.advance();
+                            _ = try self.emit(.pop, 0);
+                            _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(arr.dims[1]))));
+                        }
+                    }
+                    return;
+                }
+            }
 
             if (self.findModule(name)) |mod| {
                 if (mod == .std and self.peek.tag == .dot) {
@@ -1270,6 +1692,8 @@ pub const Compiler = struct {
                 sub_c.host_tag_count = self.host_tag_count;
                 sub_c.modules = self.modules;
                 sub_c.module_count = self.module_count;
+                sub_c.arrays = self.arrays;
+                sub_c.array_count = self.array_count;
 
                 try sub_c.parseExpression();
 

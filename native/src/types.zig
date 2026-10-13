@@ -53,6 +53,8 @@ pub const O5Result = extern struct {
     _pad: [3]u8 = [_]u8{ 0, 0, 0 },
 };
 
+pub const max_str_len: usize = 256;
+
 pub const OpCode = enum(u8) {
     nop = 0,
     push_num,
@@ -67,6 +69,12 @@ pub const OpCode = enum(u8) {
     load_state,
     store_state,
     load_host,
+
+    check_bounds,
+    load_local_elem,
+    store_local_elem,
+    load_state_elem,
+    store_state_elem,
 
     add,
     sub,

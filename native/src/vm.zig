@@ -26,6 +26,9 @@ pub const EvalError = error{
     StepLimitExceeded,
     InvalidOpcode,
     OutOfMemory,
+    OutOfBounds,
+    StringTooLong,
+    InvalidType,
 };
 
 pub const Prog = struct {
@@ -210,6 +213,72 @@ pub fn run(
                 sp += 1;
             },
 
+            .check_bounds => {
+                if (sp < 1) return EvalError.StackUnderflow;
+                const top = stack[sp - 1];
+                if (top.val_type != .num) return EvalError.InvalidType;
+                const bound: f64 = @floatFromInt(op.arg);
+                if (top.num < 0.0 or top.num >= bound) {
+                    return EvalError.OutOfBounds;
+                }
+                const idx_int: i64 = @intFromFloat(top.num);
+                if (@as(f64, @floatFromInt(idx_int)) != top.num) {
+                    return EvalError.OutOfBounds;
+                }
+            },
+
+            .load_local_elem => {
+                if (sp < 1) return EvalError.StackUnderflow;
+                const idx_val = stack[sp - 1];
+                sp -= 1;
+                if (idx_val.val_type != .num) return EvalError.InvalidType;
+                const idx: usize = @intFromFloat(idx_val.num);
+                const base: usize = @intCast(op.arg);
+                const slot = base + idx;
+                if (slot >= max_locals) return EvalError.OutOfBounds;
+                stack[sp] = locals[slot];
+                sp += 1;
+            },
+
+            .store_local_elem => {
+                if (sp < 2) return EvalError.StackUnderflow;
+                const val = stack[sp - 1];
+                const idx_val = stack[sp - 2];
+                sp -= 2;
+                if (idx_val.val_type != .num) return EvalError.InvalidType;
+                const idx: usize = @intFromFloat(idx_val.num);
+                const base: usize = @intCast(op.arg);
+                const slot = base + idx;
+                if (slot >= max_locals) return EvalError.OutOfBounds;
+                locals[slot] = val;
+            },
+
+            .load_state_elem => {
+                if (sp < 1) return EvalError.StackUnderflow;
+                const idx_val = stack[sp - 1];
+                sp -= 1;
+                if (idx_val.val_type != .num) return EvalError.InvalidType;
+                const idx: usize = @intFromFloat(idx_val.num);
+                const base: usize = @intCast(op.arg);
+                const slot = base + idx;
+                if (slot >= prog.state_slots.len) return EvalError.OutOfBounds;
+                stack[sp] = prog.state_slots[slot];
+                sp += 1;
+            },
+
+            .store_state_elem => {
+                if (sp < 2) return EvalError.StackUnderflow;
+                const val = stack[sp - 1];
+                const idx_val = stack[sp - 2];
+                sp -= 2;
+                if (idx_val.val_type != .num) return EvalError.InvalidType;
+                const idx: usize = @intFromFloat(idx_val.num);
+                const base: usize = @intCast(op.arg);
+                const slot = base + idx;
+                if (slot >= prog.state_slots.len) return EvalError.OutOfBounds;
+                prog.state_slots[slot] = val;
+            },
+
             .add => {
                 if (sp < 2) return EvalError.StackUnderflow;
                 const r = stack[sp - 1];
@@ -231,6 +300,7 @@ pub fn run(
                     }
 
                     const len = scratch_pos - start_pos;
+                    if (len > types.max_str_len) return EvalError.StringTooLong;
                     stack[sp - 1] = Value.fromStr(scratch[start_pos .. start_pos + len]);
                 } else {
                     stack[sp - 1] = Value.fromNum(l.num + r.num);

@@ -99,6 +99,8 @@ export fn o5s_run(
             error.StackOverflow => -2,
             error.StackUnderflow => -3,
             error.StepLimitExceeded => -4,
+            error.OutOfBounds => -6,
+            error.StringTooLong => -7,
             else => -5,
         };
     };

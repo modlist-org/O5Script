@@ -231,3 +231,86 @@ test "SPEC Moon_CRot tag with persistent state" {
     try std.testing.expectEqual(@as(f64, 7.5), res.num);
 }
 
+test "array literal, indexing, and length" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let a = [10, 20, 30];
+        \\a[1] + a.len
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 23.0), res.num);
+}
+
+test "typed array literal and element assignment" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let a: [3]num = [3]num{ 10, 20, 30 };
+        \\a[1] = 99;
+        \\a[1] += 1;
+        \\a[0] + a[1] + a[2]
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 140.0), res.num);
+}
+
+test "array loop with item and index" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let a = [1, 2, 3, 4, 5];
+        \\let sum = 0;
+        \\lop |v, i| a {
+        \\    sum += v * i;
+        \\}
+        \\sum
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 40.0), res.num);
+}
+
+test "multi-dimensional array" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let m = [[10, 20], [30, 40]];
+        \\m[1][0] + m[0][1] + m.len
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 52.0), res.num);
+}
+
+test "array out of bounds check" {
+    const allocator = std.testing.allocator;
+    // Static out of bounds fails compile
+    try std.testing.expectError(error.IndexOutOfBounds, compiler.compileSource("let a = [1, 2, 3]; a[10]", allocator));
+
+    // Dynamic out of bounds fails vm run
+    const prog = try compiler.compileSource("let a = [1, 2, 3]; let i = 10; a[i]", allocator);
+    defer prog.deinit();
+    try std.testing.expectError(error.OutOfBounds, vm.run(prog, 0, &[_]f64{}));
+}
+
+test "string maximum length compile limit" {
+    const allocator = std.testing.allocator;
+    // 257 byte string literal exceeds 256 byte max_str_len limit
+    var long_src: [300]u8 = undefined;
+    @memcpy(long_src[0..5], "let s");
+    long_src[5] = '=';
+    long_src[6] = '"';
+    @memset(long_src[7..270], 'a');
+    long_src[270] = '"';
+    long_src[271] = ';';
+    try std.testing.expectError(error.StringLiteralTooLong, compiler.compileSource(long_src[0..272], allocator));
+}
+
+

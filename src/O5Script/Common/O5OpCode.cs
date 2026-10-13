@@ -15,6 +15,12 @@ public enum O5OpCode : byte {
     StoreState,
     LoadHost,
 
+    CheckBounds,
+    LoadLocalElem,
+    StoreLocalElem,
+    LoadStateElem,
+    StoreStateElem,
+
     Add,
     Sub,
     Mul,
