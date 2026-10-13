@@ -693,6 +693,14 @@ pub fn run(
                 const src_slot: usize = @intCast(@as(u16, @truncate(packed_u >> 16)));
                 locals[fp + dest_slot].num += locals[fp + src_slot].num;
             },
+            .inc_local => {
+                const dest_slot: usize = @intCast(op.arg);
+                locals[fp + dest_slot].num += 1.0;
+            },
+            .dec_local => {
+                const dest_slot: usize = @intCast(op.arg);
+                locals[fp + dest_slot].num -= 1.0;
+            },
 
             .halt => {
                 break;

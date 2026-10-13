@@ -109,6 +109,8 @@ pub const OpCode = enum(u8) {
     halt,
     loop_step,
     add_local,
+    inc_local,
+    dec_local,
 };
 
 pub const Op = extern struct {

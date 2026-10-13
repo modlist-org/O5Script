@@ -783,8 +783,7 @@ pub const Compiler = struct {
                 },
                 .ret => delta = -1,
                 .halt => delta = 0,
-                .loop_step => delta = 0,
-                .add_local => delta = 0,
+                .loop_step, .add_local, .inc_local, .dec_local => delta = 0,
             }
 
             const next_depth = current_depth + delta;
@@ -1516,16 +1515,32 @@ pub const Compiler = struct {
                 }
             }
 
-            if (op_tok == .plus_equal and is_local != null and self.cur.tag == .ident and (self.peek.tag == .semicolon or self.peek.tag == .r_brace)) {
-                if (self.findLocal(self.cur.text)) |src_slot| {
-                    if (self.local_types[is_local.?] != .unknown and self.local_types[src_slot] != .unknown and self.local_types[is_local.?] != self.local_types[src_slot]) {
-                        return error.TypeMismatch;
-                    }
+            if (is_local != null and (self.peek.tag == .semicolon or self.peek.tag == .r_brace)) {
+                if (op_tok == .plus_equal and self.cur.tag == .number and self.cur.num_val == 1.0) {
+                    if (self.local_types[is_local.?] == .str) return error.TypeMismatch;
                     self.advance();
                     _ = self.match(.semicolon);
-                    const packed_arg: i64 = @bitCast(@as(u64, @intCast(is_local.?)) | (@as(u64, @intCast(src_slot)) << 16));
-                    _ = try self.emit(.add_local, packed_arg);
+                    _ = try self.emit(.inc_local, @intCast(is_local.?));
                     return;
+                }
+                if (op_tok == .minus_equal and self.cur.tag == .number and self.cur.num_val == 1.0) {
+                    if (self.local_types[is_local.?] == .str) return error.TypeMismatch;
+                    self.advance();
+                    _ = self.match(.semicolon);
+                    _ = try self.emit(.dec_local, @intCast(is_local.?));
+                    return;
+                }
+                if (op_tok == .plus_equal and self.cur.tag == .ident) {
+                    if (self.findLocal(self.cur.text)) |src_slot| {
+                        if (self.local_types[is_local.?] != .unknown and self.local_types[src_slot] != .unknown and self.local_types[is_local.?] != self.local_types[src_slot]) {
+                            return error.TypeMismatch;
+                        }
+                        self.advance();
+                        _ = self.match(.semicolon);
+                        const packed_arg: i64 = @bitCast(@as(u64, @intCast(is_local.?)) | (@as(u64, @intCast(src_slot)) << 16));
+                        _ = try self.emit(.add_local, packed_arg);
+                        return;
+                    }
                 }
             }
 

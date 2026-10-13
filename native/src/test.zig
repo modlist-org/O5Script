@@ -530,6 +530,31 @@ test "type annotations valid execution" {
     try std.testing.expectEqual(@as(f64, 17.0), res.num);
 }
 
+test "in-place increment and decrement" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let a = 10;
+        \\a += 1;
+        \\a += 1;
+        \\a -= 1;
+        \\a
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    var has_inc = false;
+    var has_dec = false;
+    for (prog.ops) |op| {
+        if (op.code == .inc_local) has_inc = true;
+        if (op.code == .dec_local) has_dec = true;
+    }
+    try std.testing.expect(has_inc);
+    try std.testing.expect(has_dec);
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 11.0), res.num);
+}
+
 
 
 

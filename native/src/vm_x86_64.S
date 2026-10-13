@@ -978,6 +978,24 @@ op_add_local:
     movsd [rbx + rdx*8], xmm0
     DISPATCH_NEXT
 
+.p2align 4
+op_inc_local:
+    mov rdx, [r12 + 8]
+    lea rdx, [rdx + rdx*2]
+    movsd xmm0, [rbx + rdx*8]
+    addsd xmm0, [rip + .Lconst_one]
+    movsd [rbx + rdx*8], xmm0
+    DISPATCH_NEXT
+
+.p2align 4
+op_dec_local:
+    mov rdx, [r12 + 8]
+    lea rdx, [rdx + rdx*2]
+    movsd xmm0, [rbx + rdx*8]
+    subsd xmm0, [rip + .Lconst_one]
+    movsd [rbx + rdx*8], xmm0
+    DISPATCH_NEXT
+
 .section .rodata
 .p2align 3
 .Lconst_one:
@@ -1051,3 +1069,5 @@ o5s_dispatch_table:
     .long op_halt - o5s_dispatch_table
     .long op_loop_step - o5s_dispatch_table
     .long op_add_local - o5s_dispatch_table
+    .long op_inc_local - o5s_dispatch_table
+    .long op_dec_local - o5s_dispatch_table
