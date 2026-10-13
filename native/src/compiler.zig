@@ -18,6 +18,12 @@ const max_host_tags = 128;
 const max_loops = 16;
 const max_breaks = 16;
 
+pub const DataType = enum {
+    unknown,
+    num,
+    str,
+};
+
 pub const CompileError = error{
     OutOfOps,
     OutOfMemory,
@@ -39,6 +45,18 @@ pub const CompileError = error{
     MissingReturn,
     ExpectedFunctionBody,
     ArgumentCountMismatch,
+
+    // Static compile-time safety checks
+    UndefinedVariable,
+    CannotAssignToConstant,
+    BreakOutsideLoop,
+    ContinueOutsideLoop,
+    TypeMismatch,
+    UnknownType,
+    InvalidJumpTarget,
+    StackUnderflow,
+    StackOverflow,
+    StackMismatch,
 };
 
 pub const TokenType = enum {
@@ -337,9 +355,12 @@ pub const Compiler = struct {
     string_len: usize = 0,
 
     locals: [max_locals][]const u8 = undefined,
+    local_types: [max_locals]DataType = @splat(.unknown),
+    local_consts: [max_locals]bool = @splat(false),
     local_count: usize = 0,
 
     states: [max_locals][]const u8 = undefined,
+    state_types: [max_locals]DataType = @splat(.unknown),
     state_inits: [max_locals]Value = undefined,
     state_count: usize = 0,
 
@@ -350,6 +371,7 @@ pub const Compiler = struct {
     tag_count: usize = 0,
 
     funcs: [max_funcs]FuncDef = undefined,
+    func_ret_types: [max_funcs]DataType = @splat(.unknown),
     func_count: usize = 0,
 
     modules: [16]ModuleBinding = undefined,
@@ -363,6 +385,8 @@ pub const Compiler = struct {
     call_fixups: [64]CallFixup = undefined,
     call_fixup_count: usize = 0,
     current_func_had_ret: bool = false,
+    current_func_ret_type: DataType = .unknown,
+    last_expr_type: DataType = .unknown,
 
     allocator: std.mem.Allocator,
 
@@ -377,6 +401,7 @@ pub const Compiler = struct {
         dims: [4]u32 = [_]u32{ 0, 0, 0, 0 },
         dim_count: u8 = 0,
         total_elements: u32 = 0,
+        elem_type: DataType = .unknown,
         is_state: bool = false,
         base_slot: usize = 0,
 
@@ -389,6 +414,11 @@ pub const Compiler = struct {
             }
             return s;
         }
+    };
+
+    pub const TypeAnnotation = struct {
+        data_type: DataType = .unknown,
+        array: ?ArrayInfo = null,
     };
 
     pub const ArrayVar = struct {
@@ -414,6 +444,16 @@ pub const Compiler = struct {
             .allocator = allocator,
             .module_count = 0,
             .array_count = 0,
+            .local_count = 0,
+            .state_count = 0,
+            .host_tag_count = 0,
+            .tag_count = 0,
+            .func_count = 0,
+            .loop_depth = 0,
+            .call_fixup_count = 0,
+            .current_func_had_ret = false,
+            .current_func_ret_type = .unknown,
+            .last_expr_type = .unknown,
         };
         c.cur = c.lexer.nextToken();
         c.peek = c.lexer.nextToken();
@@ -520,6 +560,8 @@ pub const Compiler = struct {
         if (self.local_count >= max_locals) return error.TooManyLocals;
         const idx = self.local_count;
         self.locals[idx] = name;
+        self.local_types[idx] = .unknown;
+        self.local_consts[idx] = false;
         self.local_count += 1;
         return idx;
     }
@@ -535,6 +577,7 @@ pub const Compiler = struct {
         if (self.state_count >= max_locals) return error.TooManyStates;
         const idx = self.state_count;
         self.states[idx] = name;
+        self.state_types[idx] = .unknown;
         self.state_inits[idx] = Value.fromNum(0.0);
         self.state_count += 1;
         return idx;
@@ -572,6 +615,7 @@ pub const Compiler = struct {
             .entry_ip = entry_ip,
             .param_count = param_count,
         };
+        self.func_ret_types[idx] = self.current_func_ret_type;
         self.func_count += 1;
 
         for (self.call_fixups[0..self.call_fixup_count]) |*cf| {
@@ -592,6 +636,7 @@ pub const Compiler = struct {
             if (func.param_count != arg_count) return error.ArgumentCountMismatch;
             const packed_arg: i64 = @bitCast((@as(u64, @intCast(frame_offset * 24)) << 32) | @as(u64, @intCast(func.entry_ip)));
             _ = try self.emit(.call, packed_arg);
+            self.last_expr_type = self.func_ret_types[fidx];
         } else {
             if (self.call_fixup_count >= 64) return error.TooManyCalls;
             const op_idx = try self.emit(.call, 0);
@@ -602,6 +647,7 @@ pub const Compiler = struct {
                 .arg_count = arg_count,
             };
             self.call_fixup_count += 1;
+            self.last_expr_type = .unknown;
         }
     }
 
@@ -642,6 +688,158 @@ pub const Compiler = struct {
         return null;
     }
 
+    fn verifyBytecode(self: *Compiler) CompileError!void {
+        for (self.ops[0..self.op_count]) |op| {
+            switch (op.code) {
+                .jmp, .jmp_if_zero, .jmp_if_nonzero => {
+                    if (op.arg < 0 or op.arg >= self.op_count) {
+                        return error.InvalidJumpTarget;
+                    }
+                },
+                .loop_step => {
+                    const target_ip: u32 = @truncate(@as(u64, @bitCast(op.arg)) >> 32);
+                    if (target_ip >= self.op_count) {
+                        return error.InvalidJumpTarget;
+                    }
+                },
+                .call => {
+                    const target_ip: u32 = @truncate(@as(u64, @bitCast(op.arg)));
+                    if (target_ip >= self.op_count) {
+                        return error.InvalidJumpTarget;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        var stack_depths: [max_ops]i16 = @splat(-1);
+        var worklist: [max_ops]usize = undefined;
+        var head: usize = 0;
+        var tail: usize = 0;
+
+        if (self.op_count > 0) {
+            stack_depths[0] = 0;
+            worklist[tail] = 0;
+            tail += 1;
+        }
+
+        for (self.funcs[0..self.func_count]) |f| {
+            if (f.entry_ip < self.op_count) {
+                const p_depth: i16 = @intCast(f.param_count);
+                if (stack_depths[f.entry_ip] == -1) {
+                    stack_depths[f.entry_ip] = p_depth;
+                    worklist[tail] = f.entry_ip;
+                    tail += 1;
+                }
+            }
+        }
+
+        for (self.tags[0..self.tag_count]) |t| {
+            if (t.entry_ip < self.op_count) {
+                if (stack_depths[t.entry_ip] == -1) {
+                    stack_depths[t.entry_ip] = 0;
+                    worklist[tail] = t.entry_ip;
+                    tail += 1;
+                }
+            }
+        }
+
+        while (head < tail) {
+            const ip = worklist[head];
+            head += 1;
+            const current_depth = stack_depths[ip];
+            const op = self.ops[ip];
+
+            var delta: i32 = 0;
+            switch (op.code) {
+                .nop => delta = 0,
+                .push_num, .push_0, .push_1, .push_str => delta = 1,
+                .load_local, .load_state, .load_host => delta = 1,
+                .pop, .store_local, .store_state => delta = -1,
+                .dup => delta = 1,
+                .check_bounds => delta = 0,
+                .load_local_elem, .load_state_elem => delta = 0,
+                .store_local_elem, .store_state_elem => delta = -2,
+                .add, .sub, .mul, .div, .mod => delta = -1,
+                .bit_and, .bit_or, .bit_xor, .shl, .shr => delta = -1,
+                .eq, .ne, .lt, .le, .gt, .ge => delta = -1,
+                .neg, .lnot, .bit_not => delta = 0,
+                .jmp => delta = 0,
+                .jmp_if_zero, .jmp_if_nonzero => delta = -1,
+                .call_builtin => {
+                    const arity: i32 = @intCast((op.arg >> 8) & 0xff);
+                    delta = 1 - arity;
+                },
+                .call => {
+                    var p_count: i32 = 0;
+                    const call_entry = @as(u32, @truncate(@as(u64, @bitCast(op.arg))));
+                    for (self.funcs[0..self.func_count]) |f| {
+                        if (f.entry_ip == call_entry) {
+                            p_count = @intCast(f.param_count);
+                            break;
+                        }
+                    }
+                    delta = 1 - p_count;
+                },
+                .ret => delta = -1,
+                .halt => delta = 0,
+                .loop_step => delta = 0,
+                .add_local => delta = 0,
+            }
+
+            const next_depth = current_depth + delta;
+            if (next_depth < 0) return error.StackUnderflow;
+            if (next_depth > 512) return error.StackOverflow;
+
+            if (op.code == .ret or op.code == .halt) {
+                continue;
+            }
+
+            if (op.code == .jmp) {
+                const target: usize = @intCast(op.arg);
+                if (stack_depths[target] == -1) {
+                    stack_depths[target] = @intCast(next_depth);
+                    worklist[tail] = target;
+                    tail += 1;
+                } else if (stack_depths[target] != next_depth) {
+                    return error.StackMismatch;
+                }
+                continue;
+            }
+
+            if (op.code == .jmp_if_zero or op.code == .jmp_if_nonzero) {
+                const target: usize = @intCast(op.arg);
+                if (stack_depths[target] == -1) {
+                    stack_depths[target] = @intCast(next_depth);
+                    worklist[tail] = target;
+                    tail += 1;
+                } else if (stack_depths[target] != next_depth) {
+                    return error.StackMismatch;
+                }
+            } else if (op.code == .loop_step) {
+                const target: usize = @truncate(@as(u64, @bitCast(op.arg)) >> 32);
+                if (stack_depths[target] == -1) {
+                    stack_depths[target] = @intCast(next_depth);
+                    worklist[tail] = target;
+                    tail += 1;
+                } else if (stack_depths[target] != next_depth) {
+                    return error.StackMismatch;
+                }
+            }
+
+            if (ip + 1 < self.op_count) {
+                const next_ip = ip + 1;
+                if (stack_depths[next_ip] == -1) {
+                    stack_depths[next_ip] = @intCast(next_depth);
+                    worklist[tail] = next_ip;
+                    tail += 1;
+                } else if (stack_depths[next_ip] != next_depth) {
+                    return error.StackMismatch;
+                }
+            }
+        }
+    }
+
     pub fn compile(self: *Compiler) CompileError!*Prog {
         while (self.cur.tag != .eof) {
             try self.parseStatement();
@@ -653,6 +851,8 @@ pub const Compiler = struct {
                 return error.UndefinedFunction;
             }
         }
+
+        try self.verifyBytecode();
 
         const prog = self.allocator.create(Prog) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(prog);
@@ -705,10 +905,12 @@ pub const Compiler = struct {
         return prog;
     }
 
-    fn parseTypeAnnotation(self: *Compiler) CompileError!?ArrayInfo {
+    fn parseTypeAnnotation(self: *Compiler) CompileError!?TypeAnnotation {
         if (!self.match(.colon)) return null;
         var info = ArrayInfo{};
+        var has_array = false;
         while (self.match(.l_bracket)) {
+            has_array = true;
             if (self.cur.tag != .number) return error.ExpectedArrayDimension;
             const dim: u32 = @intFromFloat(self.cur.num_val);
             self.advance();
@@ -717,22 +919,34 @@ pub const Compiler = struct {
             info.dims[info.dim_count] = dim;
             info.dim_count += 1;
         }
+        var dt: DataType = .unknown;
         if (self.cur.tag == .ident) {
+            const tname = self.cur.text;
             self.advance();
+            if (std.mem.eql(u8, tname, "num")) {
+                dt = .num;
+            } else if (std.mem.eql(u8, tname, "str")) {
+                dt = .str;
+            } else {
+                return error.UnknownType;
+            }
+        } else if (has_array) {
+            return error.SyntaxError;
         }
-        if (info.dim_count > 0) {
+        if (has_array) {
             var total: u32 = 1;
             for (info.dims[0..info.dim_count]) |d| {
                 total *= d;
             }
             info.total_elements = total;
-            return info;
+            info.elem_type = dt;
+            return TypeAnnotation{ .data_type = dt, .array = info };
         }
-        return null;
+        return TypeAnnotation{ .data_type = dt, .array = null };
     }
 
-    fn skipTypeAnnotation(self: *Compiler) void {
-        _ = self.parseTypeAnnotation() catch {};
+    fn skipTypeAnnotation(self: *Compiler) CompileError!void {
+        _ = try self.parseTypeAnnotation();
     }
 
     fn isTypedArrayHeader(self: *Compiler) bool {
@@ -780,7 +994,17 @@ pub const Compiler = struct {
                 dim_idx += 1;
             }
             info.dim_count = @intCast(dim_idx);
-            if (self.cur.tag == .ident) self.advance();
+            if (self.cur.tag == .ident) {
+                const elem_tname = self.cur.text;
+                self.advance();
+                if (std.mem.eql(u8, elem_tname, "num")) {
+                    info.elem_type = .num;
+                } else if (std.mem.eql(u8, elem_tname, "str")) {
+                    info.elem_type = .str;
+                } else {
+                    return error.UnknownType;
+                }
+            }
 
             var total: u32 = 1;
             for (info.dims[0..info.dim_count]) |d| {
@@ -817,6 +1041,9 @@ pub const Compiler = struct {
                 try self.parseArrayElements(info, current_dim + 1, flat_idx, false);
             } else {
                 try self.parseExpression();
+                if (info.elem_type != .unknown and self.last_expr_type != .unknown and info.elem_type != self.last_expr_type) {
+                    return error.TypeMismatch;
+                }
                 const slot = if (info.is_state) try self.addState("") else try self.addLocal("");
                 _ = try self.emit(if (info.is_state) .store_state else .store_local, @intCast(slot));
                 flat_idx.* += 1;
@@ -873,10 +1100,11 @@ pub const Compiler = struct {
         if (self.match(.kw_let)) {
             const name = self.cur.text;
             self.advance();
-            const type_arr = try self.parseTypeAnnotation();
+            const annot = try self.parseTypeAnnotation();
             if (self.match(.equal)) {
                 if (self.cur.tag == .l_bracket) {
-                    var arr_info = type_arr orelse ArrayInfo{};
+                    var arr_info = if (annot) |a| (a.array orelse ArrayInfo{}) else ArrayInfo{};
+                    if (annot) |a| arr_info.elem_type = a.data_type;
                     arr_info.base_slot = self.local_count;
                     arr_info.is_state = false;
                     try self.parseArrayLiteral(&arr_info);
@@ -885,23 +1113,31 @@ pub const Compiler = struct {
                     return;
                 }
                 try self.parseExpression();
-            } else {
-                if (type_arr) |t_arr| {
-                    var arr_info = t_arr;
-                    arr_info.base_slot = self.local_count;
-                    arr_info.is_state = false;
-                    for (0..arr_info.total_elements) |_| {
-                        const s = try self.addLocal("");
-                        _ = try self.emit(.push_0, 0);
-                        _ = try self.emit(.store_local, @intCast(s));
+                if (annot) |a| {
+                    if (a.data_type != .unknown and self.last_expr_type != .unknown and a.data_type != self.last_expr_type) {
+                        return error.TypeMismatch;
                     }
-                    try self.addArray(name, arr_info);
-                    _ = self.match(.semicolon);
-                    return;
+                }
+            } else {
+                if (annot) |t_annot| {
+                    if (t_annot.array) |t_arr| {
+                        var arr_info = t_arr;
+                        arr_info.base_slot = self.local_count;
+                        arr_info.is_state = false;
+                        for (0..arr_info.total_elements) |_| {
+                            const s = try self.addLocal("");
+                            _ = try self.emit(.push_0, 0);
+                            _ = try self.emit(.store_local, @intCast(s));
+                        }
+                        try self.addArray(name, arr_info);
+                        _ = self.match(.semicolon);
+                        return;
+                    }
                 }
                 _ = try self.emit(.push_0, 0);
             }
             const slot = try self.addLocal(name);
+            self.local_types[slot] = if (annot) |a| (if (a.data_type != .unknown) a.data_type else self.last_expr_type) else self.last_expr_type;
             _ = try self.emit(.store_local, @intCast(slot));
             _ = self.match(.semicolon);
             return;
@@ -910,10 +1146,11 @@ pub const Compiler = struct {
         if (self.match(.kw_sta)) {
             const name = self.cur.text;
             self.advance();
-            const type_arr = try self.parseTypeAnnotation();
+            const annot = try self.parseTypeAnnotation();
             if (self.match(.equal)) {
                 if (self.cur.tag == .l_bracket) {
-                    var arr_info = type_arr orelse ArrayInfo{};
+                    var arr_info = if (annot) |a| (a.array orelse ArrayInfo{}) else ArrayInfo{};
+                    if (annot) |a| arr_info.elem_type = a.data_type;
                     arr_info.base_slot = self.state_count;
                     arr_info.is_state = true;
                     try self.parseArrayLiteral(&arr_info);
@@ -922,24 +1159,38 @@ pub const Compiler = struct {
                     return;
                 }
                 if (self.cur.tag == .number) {
+                    if (annot) |a| {
+                        if (a.data_type == .str) return error.TypeMismatch;
+                    }
                     const init_val = self.cur.num_val;
                     self.advance();
                     const slot = try self.addState(name);
+                    self.state_types[slot] = .num;
                     self.state_inits[slot] = Value.fromNum(init_val);
                     _ = self.match(.semicolon);
                     return;
                 } else if (self.match(.minus) and self.cur.tag == .number) {
+                    if (annot) |a| {
+                        if (a.data_type == .str) return error.TypeMismatch;
+                    }
                     const init_val = -self.cur.num_val;
                     self.advance();
                     const slot = try self.addState(name);
+                    self.state_types[slot] = .num;
                     self.state_inits[slot] = Value.fromNum(init_val);
                     _ = self.match(.semicolon);
                     return;
                 } else {
                     try self.parseExpression();
+                    if (annot) |a| {
+                        if (a.data_type != .unknown and self.last_expr_type != .unknown and a.data_type != self.last_expr_type) {
+                            return error.TypeMismatch;
+                        }
+                    }
                 }
             }
             const slot = try self.addState(name);
+            self.state_types[slot] = if (annot) |a| (if (a.data_type != .unknown) a.data_type else self.last_expr_type) else self.last_expr_type;
             self.state_inits[slot] = Value.fromNum(0.0);
             _ = self.match(.semicolon);
             return;
@@ -948,7 +1199,7 @@ pub const Compiler = struct {
         if (self.match(.kw_con)) {
             const name = self.cur.text;
             self.advance();
-            self.skipTypeAnnotation();
+            const annot = try self.parseTypeAnnotation();
             _ = self.match(.equal);
 
             if (self.match(.at)) {
@@ -991,7 +1242,14 @@ pub const Compiler = struct {
             }
 
             try self.parseExpression();
+            if (annot) |a| {
+                if (a.data_type != .unknown and self.last_expr_type != .unknown and a.data_type != self.last_expr_type) {
+                    return error.TypeMismatch;
+                }
+            }
             const slot = try self.addLocal(name);
+            self.local_types[slot] = if (annot) |a| (if (a.data_type != .unknown) a.data_type else self.last_expr_type) else self.last_expr_type;
+            self.local_consts[slot] = true;
             _ = try self.emit(.store_local, @intCast(slot));
             _ = self.match(.semicolon);
             return;
@@ -1008,26 +1266,24 @@ pub const Compiler = struct {
         }
 
         if (self.match(.kw_out)) {
-            if (self.loop_depth > 0) {
-                const jmp_idx = try self.emit(.jmp, 0);
-                var loop = &self.loops[self.loop_depth - 1];
-                if (loop.break_count < max_breaks) {
-                    loop.breaks[loop.break_count] = jmp_idx;
-                    loop.break_count += 1;
-                }
+            if (self.loop_depth == 0) return error.BreakOutsideLoop;
+            const jmp_idx = try self.emit(.jmp, 0);
+            var loop = &self.loops[self.loop_depth - 1];
+            if (loop.break_count < max_breaks) {
+                loop.breaks[loop.break_count] = jmp_idx;
+                loop.break_count += 1;
             }
             _ = self.match(.semicolon);
             return;
         }
 
         if (self.match(.kw_skp)) {
-            if (self.loop_depth > 0) {
-                const jmp_idx = try self.emit(.jmp, 0);
-                var loop = &self.loops[self.loop_depth - 1];
-                if (loop.continue_count < max_breaks) {
-                    loop.continues[loop.continue_count] = jmp_idx;
-                    loop.continue_count += 1;
-                }
+            if (self.loop_depth == 0) return error.ContinueOutsideLoop;
+            const jmp_idx = try self.emit(.jmp, 0);
+            var loop = &self.loops[self.loop_depth - 1];
+            if (loop.continue_count < max_breaks) {
+                loop.continues[loop.continue_count] = jmp_idx;
+                loop.continue_count += 1;
             }
             _ = self.match(.semicolon);
             return;
@@ -1037,7 +1293,13 @@ pub const Compiler = struct {
             self.current_func_had_ret = true;
             if (self.cur.tag != .semicolon and self.cur.tag != .r_brace and self.cur.tag != .eof) {
                 try self.parseExpression();
+                if (self.current_func_ret_type != .unknown and self.last_expr_type != .unknown and self.current_func_ret_type != self.last_expr_type) {
+                    return error.TypeMismatch;
+                }
             } else {
+                if (self.current_func_ret_type != .unknown and self.current_func_ret_type != .num) {
+                    return error.TypeMismatch;
+                }
                 _ = try self.emit(.push_0, 0);
             }
             _ = try self.emit(.ret, 0);
@@ -1083,21 +1345,28 @@ pub const Compiler = struct {
 
             var param_count: usize = 0;
             var param_names: [8][]const u8 = undefined;
+            var param_types: [8]DataType = @splat(.unknown);
             while (self.cur.tag != .r_paren and self.cur.tag != .eof) {
                 param_names[param_count] = self.cur.text;
-                param_count += 1;
                 self.advance();
-                self.skipTypeAnnotation();
+                const p_annot = try self.parseTypeAnnotation();
+                param_types[param_count] = if (p_annot) |a| a.data_type else .unknown;
+                param_count += 1;
                 if (!self.match(.comma)) break;
             }
             _ = self.match(.r_paren);
-            self.skipTypeAnnotation();
+            const ret_annot = try self.parseTypeAnnotation();
+            const saved_func_ret_type = self.current_func_ret_type;
+            self.current_func_ret_type = if (ret_annot) |a| a.data_type else .unknown;
 
             const skip_jmp = try self.emit(.jmp, 0);
             const entry_ip = self.op_count;
             _ = try self.registerFunc(name, entry_ip, param_count);
 
-            const saved_locals = self.local_count;
+            const saved_locals = self.locals;
+            const saved_local_types = self.local_types;
+            const saved_local_consts = self.local_consts;
+            const saved_local_count = self.local_count;
             self.local_count = 0;
             const saved_arrays = self.array_count;
 
@@ -1105,11 +1374,15 @@ pub const Compiler = struct {
             while (p > 0) {
                 p -= 1;
                 const slot = try self.addLocal(param_names[p]);
+                self.local_types[slot] = param_types[p];
                 _ = try self.emit(.store_local, @intCast(slot));
             }
 
             if (self.match(.arrow)) {
                 try self.parseExpression();
+                if (self.current_func_ret_type != .unknown and self.last_expr_type != .unknown and self.current_func_ret_type != self.last_expr_type) {
+                    return error.TypeMismatch;
+                }
                 _ = try self.emit(.ret, 0);
             } else if (self.cur.tag == .l_brace) {
                 self.current_func_had_ret = false;
@@ -1122,8 +1395,12 @@ pub const Compiler = struct {
                 return error.ExpectedFunctionBody;
             }
 
+            self.current_func_ret_type = saved_func_ret_type;
             self.array_count = saved_arrays;
-            self.local_count = saved_locals;
+            self.locals = saved_locals;
+            self.local_types = saved_local_types;
+            self.local_consts = saved_local_consts;
+            self.local_count = saved_local_count;
             self.patchJump(skip_jmp, self.op_count);
             _ = self.match(.semicolon);
             return;
@@ -1178,6 +1455,9 @@ pub const Compiler = struct {
                     self.advance();
                     if (op_tok == .equal) {
                         try self.parseExpression();
+                        if (arr.elem_type != .unknown and self.last_expr_type != .unknown and arr.elem_type != self.last_expr_type) {
+                            return error.TypeMismatch;
+                        }
                         if (arr.is_state) {
                             _ = try self.emit(.store_state_elem, @intCast(arr.base_slot));
                         } else {
@@ -1191,6 +1471,9 @@ pub const Compiler = struct {
                             _ = try self.emit(.load_local_elem, @intCast(arr.base_slot));
                         }
                         try self.parseExpression();
+                        if (arr.elem_type != .unknown and self.last_expr_type != .unknown and arr.elem_type != self.last_expr_type) {
+                            return error.TypeMismatch;
+                        }
                         switch (op_tok) {
                             .plus_equal => _ = try self.emit(.add, 0),
                             .minus_equal => _ = try self.emit(.sub, 0),
@@ -1224,8 +1507,20 @@ pub const Compiler = struct {
             const is_local = self.findLocal(name);
             const is_state = self.findState(name);
 
+            if (is_local == null and is_state == null) {
+                return error.UndefinedVariable;
+            }
+            if (is_local) |slot| {
+                if (self.local_consts[slot]) {
+                    return error.CannotAssignToConstant;
+                }
+            }
+
             if (op_tok == .plus_equal and is_local != null and self.cur.tag == .ident and (self.peek.tag == .semicolon or self.peek.tag == .r_brace)) {
                 if (self.findLocal(self.cur.text)) |src_slot| {
+                    if (self.local_types[is_local.?] != .unknown and self.local_types[src_slot] != .unknown and self.local_types[is_local.?] != self.local_types[src_slot]) {
+                        return error.TypeMismatch;
+                    }
                     self.advance();
                     _ = self.match(.semicolon);
                     const packed_arg: i64 = @bitCast(@as(u64, @intCast(is_local.?)) | (@as(u64, @intCast(src_slot)) << 16));
@@ -1243,6 +1538,18 @@ pub const Compiler = struct {
             }
 
             try self.parseExpression();
+
+            const target_type = if (is_local) |slot| self.local_types[slot] else if (is_state) |slot| self.state_types[slot] else DataType.unknown;
+            if (target_type != .unknown and self.last_expr_type != .unknown and target_type != self.last_expr_type) {
+                return error.TypeMismatch;
+            }
+            if (op_tok == .equal) {
+                if (is_local) |slot| {
+                    if (self.local_types[slot] == .unknown) self.local_types[slot] = self.last_expr_type;
+                } else if (is_state) |slot| {
+                    if (self.state_types[slot] == .unknown) self.state_types[slot] = self.last_expr_type;
+                }
+            }
 
             switch (op_tok) {
                 .plus_equal => _ = try self.emit(.add, 0),
@@ -1548,17 +1855,33 @@ pub const Compiler = struct {
         try self.parseShift();
         while (true) {
             if (self.match(.less)) {
+                const lhs_type = self.last_expr_type;
+                if (lhs_type == .str) return error.TypeMismatch;
                 try self.parseShift();
+                if (self.last_expr_type == .str) return error.TypeMismatch;
                 _ = try self.emit(.lt, 0);
+                self.last_expr_type = .num;
             } else if (self.match(.less_equal)) {
+                const lhs_type = self.last_expr_type;
+                if (lhs_type == .str) return error.TypeMismatch;
                 try self.parseShift();
+                if (self.last_expr_type == .str) return error.TypeMismatch;
                 _ = try self.emit(.le, 0);
+                self.last_expr_type = .num;
             } else if (self.match(.greater)) {
+                const lhs_type = self.last_expr_type;
+                if (lhs_type == .str) return error.TypeMismatch;
                 try self.parseShift();
+                if (self.last_expr_type == .str) return error.TypeMismatch;
                 _ = try self.emit(.gt, 0);
+                self.last_expr_type = .num;
             } else if (self.match(.greater_equal)) {
+                const lhs_type = self.last_expr_type;
+                if (lhs_type == .str) return error.TypeMismatch;
                 try self.parseShift();
+                if (self.last_expr_type == .str) return error.TypeMismatch;
                 _ = try self.emit(.ge, 0);
+                self.last_expr_type = .num;
             } else break;
         }
     }
@@ -1567,11 +1890,19 @@ pub const Compiler = struct {
         try self.parseAddSub();
         while (true) {
             if (self.match(.less_less)) {
+                const lhs_type = self.last_expr_type;
+                if (lhs_type == .str) return error.TypeMismatch;
                 try self.parseAddSub();
+                if (self.last_expr_type == .str) return error.TypeMismatch;
                 _ = try self.emit(.shl, 0);
+                self.last_expr_type = .num;
             } else if (self.match(.greater_greater)) {
+                const lhs_type = self.last_expr_type;
+                if (lhs_type == .str) return error.TypeMismatch;
                 try self.parseAddSub();
+                if (self.last_expr_type == .str) return error.TypeMismatch;
                 _ = try self.emit(.shr, 0);
+                self.last_expr_type = .num;
             } else break;
         }
     }
@@ -1580,11 +1911,24 @@ pub const Compiler = struct {
         try self.parseMulDiv();
         while (true) {
             if (self.match(.plus)) {
+                const lhs_type = self.last_expr_type;
                 try self.parseMulDiv();
+                const rhs_type = self.last_expr_type;
                 _ = try self.emit(.add, 0);
+                if (lhs_type == .str or rhs_type == .str) {
+                    self.last_expr_type = .str;
+                } else if (lhs_type == .num and rhs_type == .num) {
+                    self.last_expr_type = .num;
+                } else {
+                    self.last_expr_type = .unknown;
+                }
             } else if (self.match(.minus)) {
+                const lhs_type = self.last_expr_type;
+                if (lhs_type == .str) return error.TypeMismatch;
                 try self.parseMulDiv();
+                if (self.last_expr_type == .str) return error.TypeMismatch;
                 _ = try self.emit(.sub, 0);
+                self.last_expr_type = .num;
             } else break;
         }
     }
@@ -1593,14 +1937,26 @@ pub const Compiler = struct {
         try self.parseUnary();
         while (true) {
             if (self.match(.star)) {
+                const lhs_type = self.last_expr_type;
+                if (lhs_type == .str) return error.TypeMismatch;
                 try self.parseUnary();
+                if (self.last_expr_type == .str) return error.TypeMismatch;
                 _ = try self.emit(.mul, 0);
+                self.last_expr_type = .num;
             } else if (self.match(.slash)) {
+                const lhs_type = self.last_expr_type;
+                if (lhs_type == .str) return error.TypeMismatch;
                 try self.parseUnary();
+                if (self.last_expr_type == .str) return error.TypeMismatch;
                 _ = try self.emit(.div, 0);
+                self.last_expr_type = .num;
             } else if (self.match(.percent)) {
+                const lhs_type = self.last_expr_type;
+                if (lhs_type == .str) return error.TypeMismatch;
                 try self.parseUnary();
+                if (self.last_expr_type == .str) return error.TypeMismatch;
                 _ = try self.emit(.mod, 0);
+                self.last_expr_type = .num;
             } else break;
         }
     }
@@ -1608,13 +1964,18 @@ pub const Compiler = struct {
     fn parseUnary(self: *Compiler) CompileError!void {
         if (self.match(.minus)) {
             try self.parseUnary();
+            if (self.last_expr_type == .str) return error.TypeMismatch;
             _ = try self.emit(.neg, 0);
+            self.last_expr_type = .num;
         } else if (self.match(.bang)) {
             try self.parseUnary();
             _ = try self.emit(.lnot, 0);
+            self.last_expr_type = .num;
         } else if (self.match(.tilde)) {
             try self.parseUnary();
+            if (self.last_expr_type == .str) return error.TypeMismatch;
             _ = try self.emit(.bit_not, 0);
+            self.last_expr_type = .num;
         } else {
             try self.parsePrimary();
         }
@@ -1624,6 +1985,7 @@ pub const Compiler = struct {
         if (self.cur.tag == .number) {
             const val = self.cur.num_val;
             self.advance();
+            self.last_expr_type = .num;
             if (val == 0.0) {
                 _ = try self.emit(.push_0, 0);
             } else if (val == 1.0) {
@@ -1635,10 +1997,12 @@ pub const Compiler = struct {
         }
 
         if (self.match(.kw_tru)) {
+            self.last_expr_type = .num;
             _ = try self.emit(.push_1, 0);
             return;
         }
         if (self.match(.kw_fls)) {
+            self.last_expr_type = .num;
             _ = try self.emit(.push_0, 0);
             return;
         }
@@ -1647,6 +2011,7 @@ pub const Compiler = struct {
             const name = self.cur.text;
             self.advance();
             const host_idx = try self.getOrAddHostTag(name);
+            self.last_expr_type = .num;
             _ = try self.emit(.load_host, @intCast(host_idx));
             return;
         }
@@ -1655,6 +2020,7 @@ pub const Compiler = struct {
             const raw_str = self.cur.text;
             self.advance();
             try self.compileInterpolatedString(raw_str);
+            self.last_expr_type = .str;
             return;
         }
 
@@ -1676,9 +2042,11 @@ pub const Compiler = struct {
             try self.parseArrayLiteral(&arr_info);
             if (self.cur.tag == .l_bracket) {
                 try self.emitArrayIndexing(arr_info);
+                self.last_expr_type = if (arr_info.elem_type != .unknown) arr_info.elem_type else .num;
                 return;
             }
             _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(arr_info.dims[0]))));
+            self.last_expr_type = .num;
             return;
         }
 
@@ -1692,6 +2060,7 @@ pub const Compiler = struct {
                     if (self.cur.tag == .ident and std.mem.eql(u8, self.cur.text, "len")) {
                         self.advance();
                         _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(arr.dims[0]))));
+                        self.last_expr_type = .num;
                         return;
                     }
                 }
@@ -1703,7 +2072,10 @@ pub const Compiler = struct {
                             self.advance();
                             _ = try self.emit(.pop, 0);
                             _ = try self.emit(.push_num, @bitCast(@as(f64, @floatFromInt(arr.dims[1]))));
+                            self.last_expr_type = .num;
                         }
+                    } else {
+                        self.last_expr_type = if (arr.elem_type != .unknown) arr.elem_type else .num;
                     }
                     return;
                 }
@@ -1717,12 +2089,14 @@ pub const Compiler = struct {
                         self.advance();
                         self.advance();
                         try self.parseMathMember();
+                        self.last_expr_type = .num;
                         return;
                     }
                 } else if (mod == .math and self.peek.tag == .dot) {
                     self.advance();
                     self.advance();
                     try self.parseMathMember();
+                    self.last_expr_type = .num;
                     return;
                 }
             }
@@ -1743,20 +2117,21 @@ pub const Compiler = struct {
             }
 
             if (self.findLocal(name)) |slot| {
+                self.last_expr_type = self.local_types[slot];
                 _ = try self.emit(.load_local, @intCast(slot));
                 return;
             }
 
             if (self.findState(name)) |slot| {
+                self.last_expr_type = self.state_types[slot];
                 _ = try self.emit(.load_state, @intCast(slot));
                 return;
             }
 
-            _ = try self.emit(.push_0, 0);
-            return;
+            return error.UndefinedVariable;
         }
 
-        _ = try self.emit(.push_0, 0);
+        return error.SyntaxError;
     }
 
     fn parseMathMember(self: *Compiler) CompileError!void {
@@ -1865,8 +2240,11 @@ pub const Compiler = struct {
                 sub_c.string_bytes = self.string_bytes;
                 sub_c.string_len = self.string_len;
                 sub_c.locals = self.locals;
+                sub_c.local_types = self.local_types;
+                sub_c.local_consts = self.local_consts;
                 sub_c.local_count = self.local_count;
                 sub_c.states = self.states;
+                sub_c.state_types = self.state_types;
                 sub_c.state_count = self.state_count;
                 sub_c.host_tags = self.host_tags;
                 sub_c.host_tag_count = self.host_tag_count;

@@ -471,6 +471,65 @@ test "string interpolation with ternary and brace escaping" {
     try std.testing.expectEqualStrings("val: 10, literal: {100}", res.toSlice());
 }
 
+test "compile error undefined variable" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UndefinedVariable, compiler.compileSource("let x = foo + 1;", allocator));
+    try std.testing.expectError(error.UndefinedVariable, compiler.compileSource("bar = 10;", allocator));
+}
+
+test "compile error cannot assign to constant" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.CannotAssignToConstant, compiler.compileSource("con MAX = 100; MAX = 200;", allocator));
+    try std.testing.expectError(error.CannotAssignToConstant, compiler.compileSource("con MAX = 100; MAX += 5;", allocator));
+}
+
+test "compile error break or continue outside loop" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.BreakOutsideLoop, compiler.compileSource("out;", allocator));
+    try std.testing.expectError(error.ContinueOutsideLoop, compiler.compileSource("skp;", allocator));
+    try std.testing.expectError(error.BreakOutsideLoop, compiler.compileSource("fun f() { out; ret 0; }", allocator));
+}
+
+test "compile error unknown type annotation" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UnknownType, compiler.compileSource("let x: int = 10;", allocator));
+    try std.testing.expectError(error.UnknownType, compiler.compileSource("let y: bool = tru;", allocator));
+}
+
+test "compile error type mismatch" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("let x: num = \"hello\";", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("let x: str = 123;", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("sta s: num = \"hello\";", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("con c: num = \"hello\";", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("let arr: [3]num = [1, \"foo\", 3];", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("fun f(): num { ret \"bar\"; }", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("fun f(): num => \"bar\";", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("let x = \"str\" * 2;", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("let x = -\"str\";", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("let x = \"str\" - 1;", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("let x = \"str\" >> 1;", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("let x = \"str\" > 0;", allocator));
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource("let x: num = 1; x = \"str\";", allocator));
+}
+
+test "type annotations valid execution" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let x: num = 10;
+        \\let s: str = "hello";
+        \\sta count: num = 5;
+        \\con STEP: num = 2;
+        \\fun add(a: num, b: num): num => a + b;
+        \\add(x, count) + STEP
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 17.0), res.num);
+}
+
 
 
 
