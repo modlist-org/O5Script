@@ -1,0 +1,8 @@
+[Bb]in/
+[Oo]bj/
+.idea/
+.vscode/
+*.user
+*.suo
+.zig-cache/
+zig-out/

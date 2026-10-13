@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/O5Script/O5Script.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/O5Script.Tests/O5Script.Tests.csproj" />
+  </Folder>
+</Solution>
