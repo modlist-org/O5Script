@@ -450,13 +450,19 @@ op_shr:
     DISPATCH_NEXT
 
 .p2align 4
-# Fuse a comparison followed by jmp_if_zero without materializing a boolean.
+# Fuse a comparison followed by jmp_if_zero or jmp_if_nonzero without materializing a boolean.
 op_eq:
     sub r10, 24
+    cmp byte ptr [r11 + r10 + 20], 1     # r.val_type == 1 (str)?
+    je .Lasm_str_eq
+    cmp byte ptr [r11 + r10 - 4], 1      # l.val_type == 1 (str)?
+    je .Lasm_str_eq
     movsd xmm0, [r11 + r10 - 24]
     movsd xmm1, [r11 + r10]
     cmp byte ptr [r12 + 16], 37          # jmp_if_zero
     je .Leq_fuse_jmp_zero
+    cmp byte ptr [r12 + 16], 38          # jmp_if_nonzero
+    je .Leq_fuse_jmp_nonzero
     ucomisd xmm0, xmm1
     sete al
     setnp cl
@@ -473,11 +479,48 @@ op_eq:
     jp .Leq_take_jmp
     add r12, 16
     DISPATCH_NEXT
+.Leq_fuse_jmp_nonzero:
+    sub r10, 24
+    ucomisd xmm0, xmm1
+    jp .Leq_no_jmp_nonzero
+    je .Leq_take_jmp
+.Leq_no_jmp_nonzero:
+    add r12, 16
+    DISPATCH_NEXT
 .Leq_take_jmp:
     mov rax, [r12 + 24]
     shl rax, 4
     lea r12, [r15 + rax]
     DISPATCH_CUR
+
+.Lasm_str_eq:
+    lea rdi, [r11 + r10 - 24]
+    lea rsi, [r11 + r10]
+    mov [rbp - 72], r10
+    call o5s_asm_str_eq
+    mov r10, [rbp - 72]
+    lea r11, [rsp + 32768]
+    lea r9, [rip + o5s_dispatch_table]
+    cmp byte ptr [r12 + 16], 38          # jmp_if_nonzero
+    je .Lstr_eq_fuse_nonzero
+    cmp byte ptr [r12 + 16], 37          # jmp_if_zero
+    je .Lstr_eq_fuse_zero
+    cvtsi2sd xmm0, eax
+    movsd [r11 + r10 - 24], xmm0
+    mov dword ptr [r11 + r10 - 4], 0
+    DISPATCH_NEXT
+.Lstr_eq_fuse_nonzero:
+    sub r10, 24
+    test eax, eax
+    jnz .Leq_take_jmp
+    add r12, 16
+    DISPATCH_NEXT
+.Lstr_eq_fuse_zero:
+    sub r10, 24
+    test eax, eax
+    jz .Leq_take_jmp
+    add r12, 16
+    DISPATCH_NEXT
 
 .p2align 4
 op_ne:

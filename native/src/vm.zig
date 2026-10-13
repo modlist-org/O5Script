@@ -139,6 +139,13 @@ export fn o5s_asm_str_add(l: *Value, r: *Value) callconv(.{ .x86_64_sysv = .{} }
     }
 }
 
+export fn o5s_asm_str_eq(l: *Value, r: *Value) callconv(.{ .x86_64_sysv = .{} }) u32 {
+    if (l.val_type == .str and r.val_type == .str) {
+        return if (std.mem.eql(u8, l.toSlice(), r.toSlice())) 1 else 0;
+    }
+    return 0;
+}
+
 export fn o5s_asm_builtin_call(packed_arg: i64, stack_top: [*]Value) callconv(.{ .x86_64_sysv = .{} }) usize {
     const builtin_id: Builtin = @enumFromInt(@as(u8, @truncate(@as(u64, @bitCast(packed_arg)))));
     const arity: u8 = @truncate(@as(u64, @bitCast(packed_arg)) >> 8);

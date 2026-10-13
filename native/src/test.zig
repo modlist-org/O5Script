@@ -624,9 +624,9 @@ test "struct mutation and inc_local optimization" {
     try std.testing.expectEqual(@as(f64, 51.0), res.num);
 }
 
-test "struct copy assignment" {
+test "struct reference and copy assignment" {
     const allocator = std.testing.allocator;
-    const src =
+    const src_ref =
         \\stu Vec2 {
         \\    x: num,
         \\    y: num,
@@ -636,12 +636,187 @@ test "struct copy assignment" {
         \\b.x += 5;
         \\b.x + b.y + a.x
     ;
+    const prog_ref = try compiler.compileSource(src_ref, allocator);
+    defer prog_ref.deinit();
+    const res_ref = try vm.run(prog_ref, 0, &[_]f64{});
+    // Reference semantics: mutating b.x also mutates a.x => 105 + 200 + 105 = 410
+    try std.testing.expectEqual(@as(f64, 410.0), res_ref.num);
+
+    const src_copy =
+        \\stu Vec2 {
+        \\    x: num,
+        \\    y: num,
+        \\}
+        \\let a = Vec2 { x: 100, y: 200 };
+        \\let b: Vec2 = |a|;
+        \\b.x += 5;
+        \\b.x + b.y + a.x
+    ;
+    const prog_copy = try compiler.compileSource(src_copy, allocator);
+    defer prog_copy.deinit();
+    const res_copy = try vm.run(prog_copy, 0, &[_]f64{});
+    // Copy semantics: mutating b.x leaves a.x unchanged => 105 + 200 + 100 = 405
+    try std.testing.expectEqual(@as(f64, 405.0), res_copy.num);
+}
+
+test "struct and string lifetime error on scope escape" {
+    const allocator = std.testing.allocator;
+    // Struct reference escape must fail with LifetimeError
+    try std.testing.expectError(error.LifetimeError, compiler.compileSource(
+        \\stu Vec2 { x: num, y: num }
+        \\let a = Vec2 { x: 1, y: 2 };
+        \\{
+        \\    let b = Vec2 { x: 3, y: 4 };
+        \\    a = b;
+        \\}
+    , allocator));
+
+    // Struct explicit copy escape is allowed
+    const src_stu_copy =
+        \\stu Vec2 { x: num, y: num }
+        \\let a = Vec2 { x: 1, y: 2 };
+        \\{
+        \\    let b = Vec2 { x: 3, y: 4 };
+        \\    a = |b|;
+        \\}
+        \\a.x + a.y
+    ;
+    const prog_stu_copy = try compiler.compileSource(src_stu_copy, allocator);
+    defer prog_stu_copy.deinit();
+    const res_stu_copy = try vm.run(prog_stu_copy, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 7.0), res_stu_copy.num);
+
+    // String reference escape must fail with LifetimeError
+    try std.testing.expectError(error.LifetimeError, compiler.compileSource(
+        \\let s: str = "init";
+        \\{
+        \\    let inner: str = "inner";
+        \\    s = inner;
+        \\}
+    , allocator));
+
+    // String explicit copy escape is allowed
+    const src_str_copy =
+        \\let s: str = "init";
+        \\{
+        \\    let inner: str = "inner";
+        \\    s = |inner|;
+        \\}
+        \\s
+    ;
+    const prog_str_copy = try compiler.compileSource(src_str_copy, allocator);
+    defer prog_str_copy.deinit();
+    const res_str_copy = try vm.run(prog_str_copy, 0, &[_]f64{});
+    try std.testing.expectEqualStrings("inner", res_str_copy.toSlice());
+}
+
+test "jmp statement numbers and fallthrough" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun test_jmp(n: num): num {
+        \\    let r = 0;
+        \\    jmp n {
+        \\        1:
+        \\            r = 10;
+        \\            skp;
+        \\        2:
+        \\        3:
+        \\            r = 20;
+        \\            skp;
+        \\        4: {
+        \\            r = 40;
+        \\            skp;
+        \\        }
+        \\        _:
+        \\            r = 99;
+        \\    }
+        \\    ret r;
+        \\}
+        \\test_jmp(1) + test_jmp(2) + test_jmp(3) + test_jmp(4) + test_jmp(5)
+    ;
     const prog = try compiler.compileSource(src, allocator);
     defer prog.deinit();
-
     const res = try vm.run(prog, 0, &[_]f64{});
-    // b.x = 105, b.y = 200, a.x = 100 => 405
-    try std.testing.expectEqual(@as(f64, 405.0), res.num);
+    // 10 + 20 + 20 + 40 + 99 = 189
+    try std.testing.expectEqual(@as(f64, 189.0), res.num);
+
+    // Fallthrough without skp
+    const src_fallthrough =
+        \\let r = 0;
+        \\jmp 1 {
+        \\    1:
+        \\        r += 1;
+        \\    2:
+        \\        r += 10;
+        \\        skp;
+        \\}
+        \\r
+    ;
+    const prog_ft = try compiler.compileSource(src_fallthrough, allocator);
+    defer prog_ft.deinit();
+    const res_ft = try vm.run(prog_ft, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 11.0), res_ft.num);
+}
+
+test "jmp statement strings" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\fun check_fruit(s: str): num {
+        \\    let r = 0;
+        \\    jmp s {
+        \\        "apple":
+        \\            r = 1;
+        \\            skp;
+        \\        "banana": {
+        \\            r = 2;
+        \\            skp;
+        \\        }
+        \\        _:
+        \\            r = 3;
+        \\    }
+        \\    ret r;
+        \\}
+        \\check_fruit("apple") + check_fruit("banana") * 10 + check_fruit("other") * 100
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 1 + 20 + 300 = 321
+    try std.testing.expectEqual(@as(f64, 321.0), res.num);
+}
+
+test "go statement and labels" {
+    const allocator = std.testing.allocator;
+    // Forward jump
+    const src_fwd =
+        \\let x = 1;
+        \\go $target;
+        \\x = 999;
+        \\$target:
+        \\x
+    ;
+    const prog_fwd = try compiler.compileSource(src_fwd, allocator);
+    defer prog_fwd.deinit();
+    const res_fwd = try vm.run(prog_fwd, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 1.0), res_fwd.num);
+
+    // Backward jump (loop)
+    const src_bwd =
+        \\let x = 0;
+        \\$start:
+        \\x += 1;
+        \\if x < 10 {
+        \\    go $start;
+        \\}
+        \\x
+    ;
+    const prog_bwd = try compiler.compileSource(src_bwd, allocator);
+    defer prog_bwd.deinit();
+    const res_bwd = try vm.run(prog_bwd, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 10.0), res_bwd.num);
+
+    // Undefined label compile error
+    try std.testing.expectError(error.UndefinedVariable, compiler.compileSource("go $missing;", allocator));
 }
 
 test "state struct persistence" {

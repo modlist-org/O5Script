@@ -83,7 +83,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var file_buffer: ?[]const u8 = null;
         defer if (file_buffer) |buf| allocator.free(buf);
 
-        if (std.mem.endsWith(u8, arg, ".o5s")) {
+        if (std.mem.eql(u8, arg, "-e")) {
+            if (it.next()) |code| {
+                source = code;
+            }
+        } else if (std.mem.endsWith(u8, arg, ".o5s")) {
             if (readFile(allocator, arg)) |content| {
                 source = content;
                 file_buffer = content;
