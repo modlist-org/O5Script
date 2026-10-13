@@ -664,55 +664,75 @@ op_jmp_if_nonzero:
 # Inline cheap builtins; use helpers for the remaining math functions.
 op_call_builtin:
     movzx eax, byte ptr [r12 + 8]
-    cmp al, 7                           # sqrt
+    test al, al                         # sin
     jne 1f
-    sqrtsd xmm0, [r11 + r10 - 24]
+    movsd xmm0, [r11 + r10 - 24]
+    movsd xmm1, xmm0
+    mulsd xmm1, [rip + .Lconst_inv_twopi]
+    roundsd xmm1, xmm1, 0
+    mulsd xmm1, [rip + .Lconst_twopi]
+    subsd xmm0, xmm1
+    movsd xmm1, xmm0
+    mulsd xmm1, xmm0
+    movsd xmm2, [rip + .Lconst_sin_c2]
+    mulsd xmm2, xmm1
+    addsd xmm2, [rip + .Lconst_sin_c1]
+    mulsd xmm2, xmm1
+    addsd xmm2, [rip + .Lconst_sin_c0]
+    mulsd xmm2, xmm1
+    addsd xmm2, [rip + .Lconst_one]
+    mulsd xmm0, xmm2
     movsd [r11 + r10 - 24], xmm0
     DISPATCH_NEXT
 1:
-    cmp al, 8                           # abs
+    cmp al, 1                           # cos
     jne 2f
-    mov rax, 0x7fffffffffffffff
-    and [r11 + r10 - 24], rax
+    movsd xmm0, [r11 + r10 - 24]
+    movsd xmm1, xmm0
+    mulsd xmm1, [rip + .Lconst_inv_twopi]
+    roundsd xmm1, xmm1, 0
+    mulsd xmm1, [rip + .Lconst_twopi]
+    subsd xmm0, xmm1
+    mulsd xmm0, xmm0
+    movsd xmm2, [rip + .Lconst_cos_c3]
+    mulsd xmm2, xmm0
+    addsd xmm2, [rip + .Lconst_cos_c2]
+    mulsd xmm2, xmm0
+    addsd xmm2, [rip + .Lconst_cos_c1]
+    mulsd xmm2, xmm0
+    addsd xmm2, [rip + .Lconst_cos_c0]
+    mulsd xmm2, xmm0
+    addsd xmm2, [rip + .Lconst_one]
+    movsd [r11 + r10 - 24], xmm2
     DISPATCH_NEXT
 2:
-    cmp al, 9                           # floor
+    cmp al, 7                           # sqrt
     jne 3f
-    roundsd xmm0, [r11 + r10 - 24], 1
+    sqrtsd xmm0, [r11 + r10 - 24]
     movsd [r11 + r10 - 24], xmm0
     DISPATCH_NEXT
 3:
-    cmp al, 10                          # ceil
+    cmp al, 8                           # abs
     jne 4f
-    roundsd xmm0, [r11 + r10 - 24], 2
-    movsd [r11 + r10 - 24], xmm0
+    mov rax, 0x7fffffffffffffff
+    and [r11 + r10 - 24], rax
     DISPATCH_NEXT
 4:
-    cmp al, 11                          # round
+    cmp al, 9                           # floor
     jne 5f
-    roundsd xmm0, [r11 + r10 - 24], 0
+    roundsd xmm0, [r11 + r10 - 24], 1
     movsd [r11 + r10 - 24], xmm0
     DISPATCH_NEXT
 5:
-    test al, al                         # sin
+    cmp al, 10                          # ceil
     jne 6f
-    movsd xmm0, [r11 + r10 - 24]
-    mov [rbp - 72], r10
-    call sin
-    mov r10, [rbp - 72]
-    lea r11, [rsp + 32768]
-    lea r9, [rip + o5s_dispatch_table]
+    roundsd xmm0, [r11 + r10 - 24], 2
     movsd [r11 + r10 - 24], xmm0
     DISPATCH_NEXT
 6:
-    cmp al, 1                           # cos
+    cmp al, 11                          # round
     jne 7f
-    movsd xmm0, [r11 + r10 - 24]
-    mov [rbp - 72], r10
-    call cos
-    mov r10, [rbp - 72]
-    lea r11, [rsp + 32768]
-    lea r9, [rip + o5s_dispatch_table]
+    roundsd xmm0, [r11 + r10 - 24], 0
     movsd [r11 + r10 - 24], xmm0
     DISPATCH_NEXT
 7:
@@ -956,6 +976,24 @@ op_add_local:
     .double 1.0
 .Lconst_four:
     .double 4.0
+.Lconst_inv_twopi:
+    .double 0.1591549430918953357688837633725
+.Lconst_twopi:
+    .double 6.283185307179586476925286766559
+.Lconst_sin_c2:
+    .double -0.0001984126984126984126984
+.Lconst_sin_c1:
+    .double 0.0083333333333333333333333
+.Lconst_sin_c0:
+    .double -0.1666666666666666666666667
+.Lconst_cos_c3:
+    .double 0.0000248015873015873015873
+.Lconst_cos_c2:
+    .double -0.0013888888888888888888889
+.Lconst_cos_c1:
+    .double 0.0416666666666666666666667
+.Lconst_cos_c0:
+    .double -0.5
 
 .p2align 3
 # Keep this order in sync with OpCode in types.zig.
