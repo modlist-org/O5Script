@@ -248,27 +248,27 @@ let p = Point { x: 10, y: 20 };
 let p2 = Point { 10, 20 };
 ```
 
-### Member Methods & Automatic `slp` Detection
+### Member Methods & Automatic `slf` Detection
 Methods can be declared directly inside `stu` or externally with `fun StructName.method(...)`.
-The compiler scans the function body for occurrences of `slp` (self):
-- **If `slp` is used**: The compiler automatically injects the receiver as a pass-by-reference 0th parameter without requiring the user to declare it in the parameter list. The caller automatically pushes the relative stack offset, allowing direct, in-place mutation of caller stack fields.
-- **If `slp` is NOT used**: The method is compiled as a zero-overhead static function with no receiver argument passed.
+The compiler scans the function body for occurrences of `slf` (self):
+- **If `slf` is used**: The compiler automatically injects the receiver as a pass-by-reference 0th parameter without requiring the user to declare it in the parameter list. The caller automatically pushes the relative stack offset, allowing direct, in-place mutation of caller stack fields.
+- **If `slf` is NOT used**: The method is compiled as a zero-overhead static function with no receiver argument passed.
 
 ```o5s
 stu Counter {
     val: num,
     step: num,
 
-    // slp is automatically detected and injected:
+    // slf is automatically detected and injected:
     add() {
-        slp.val += slp.step;
+        slf.val += slf.step;
     },
 
     get(): num {
-        ret slp.val;
+        ret slf.val;
     },
 
-    // Pure helper (no slp) - compiled as static method:
+    // Pure helper (no slf) - compiled as static method:
     double(n: num): num {
         ret n * 2;
     }
@@ -283,10 +283,43 @@ let v = c.get(); // 15
 Methods can also be attached after struct declaration:
 ```o5s
 fun Point.translate(dx: num, dy: num) {
-    slp.x += dx;
-    slp.y += dy;
+    slf.x += dx;
+    slf.y += dy;
 }
 ```
+
+### Self Return (`: slf`) & Chaining
+A method returning `: slf` returns its own receiver by reference (zero-copy,
+same object — the `&mut self` equivalent). `ret slf;` is explicit; bare
+`ret;` or falling off the end of an `: slf` method returns `slf` implicitly.
+Results chain (`p.a().b()`), read fields (`p.a().x`), or bind as an alias
+(`let q = p.a();` — `q` references `p`):
+```o5s
+stu Point {
+    x: num,
+    y: num,
+
+    move(dx: num, dy: num): slf {
+        slf.x += dx;
+        slf.y += dy;
+        ret slf;
+    },
+
+    bump(n: num): slf {
+        slf.x += n;
+        // implicit `ret slf;`
+    }
+}
+
+let p = Point { x: 0, y: 0 };
+p.move(1, 2).bump(3);
+let q = p.move(10, 20); // q aliases p
+q.x // 14
+```
+Rules: `: slf` is only valid on instance methods (implies `slf`); `slf`
+results may only be chained, field-read, aliased with `let`, or used as a bare
+statement — never as a numeric operand. Methods on `sta` receivers operate on a
+scratch copy (single-call semantics apply per chain link).
 
 ### Nested Structs & Chained Invocations
 Structs can contain other structs as fields. Method calls and mutations chain naturally with exact relative stack frame offsets:
@@ -294,14 +327,14 @@ Structs can contain other structs as fields. Method calls and mutations chain na
 stu Engine {
     rpm: num,
     rev() {
-        slp.rpm += 500;
+        slf.rpm += 500;
     }
 }
 
 stu Car {
     engine: Engine,
     accelerate() {
-        slp.engine.rev();
+        slf.engine.rev();
     }
 }
 

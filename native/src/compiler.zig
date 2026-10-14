@@ -395,6 +395,7 @@ pub const Compiler = struct {
 
     funcs: [max_funcs]FuncDef = undefined,
     func_ret_types: [max_funcs]DataType = @splat(.unknown),
+    func_ret_structs: [max_funcs]?[]const u8 = @splat(null),
     func_param_annots: [max_funcs][8]?TypeAnnotation = @splat(@splat(null)),
     func_count: usize = 0,
 
@@ -424,10 +425,15 @@ pub const Compiler = struct {
     call_fixup_count: usize = 0,
     current_func_had_ret: bool = false,
     current_func_ret_type: DataType = .unknown,
+    current_func_ret_is_slf: bool = false,
+    current_func_ret_struct: ?[]const u8 = null,
+    current_func_slf_slot: usize = 0,
     current_func_name: ?[]const u8 = null,
     last_expr_type: DataType = .unknown,
     last_stmt_had_value: bool = false,
     copy_depth: usize = 0,
+    expr_depth: usize = 0,
+    last_chain_recv: ?SlfRecv = null,
 
     allocator: std.mem.Allocator,
 
@@ -491,7 +497,7 @@ pub const Compiler = struct {
         pub const StructMethod = struct {
             name: []const u8,
             func_name: []const u8,
-            uses_slp: bool,
+            uses_slf: bool,
         };
 
         pub fn addField(self: *StructDef, name: []const u8, dt: DataType, child_struct: ?[]const u8, slot_cnt: usize) CompileError!void {
@@ -508,12 +514,12 @@ pub const Compiler = struct {
             self.total_slots += slot_cnt;
         }
 
-        pub fn addMethod(self: *StructDef, name: []const u8, func_name: []const u8, uses_slp: bool) CompileError!void {
+        pub fn addMethod(self: *StructDef, name: []const u8, func_name: []const u8, uses_slf: bool) CompileError!void {
             if (self.method_count >= 16) return error.TooManyFuncs;
             self.methods[self.method_count] = .{
                 .name = name,
                 .func_name = func_name,
-                .uses_slp = uses_slp,
+                .uses_slf = uses_slf,
             };
             self.method_count += 1;
         }
@@ -543,6 +549,21 @@ pub const Compiler = struct {
         is_reference: bool = false,
         is_const: bool = false,
         is_param_ref: bool = false,
+    };
+
+    // Receiver descriptor for `: slf` method chaining (`p.a().b()`).
+    // `slf` always aliases the original receiver object, so a chained link
+    // re-emits the receiver push from this static description instead of
+    // reusing the runtime value on the stack.
+    pub const SlfRecv = struct {
+        struct_name: []const u8,
+        svar_base: usize,
+        total_off: usize,
+        is_param_ref: bool,
+        is_state: bool,
+        eff_base: usize = 0,
+        eff_valid: bool = false,
+        link_off: usize = 0,
     };
 
     pub const TypeAnnotation = struct {
@@ -591,9 +612,14 @@ pub const Compiler = struct {
             .call_fixup_count = 0,
             .current_func_had_ret = false,
             .current_func_ret_type = .unknown,
+            .current_func_ret_is_slf = false,
+            .current_func_ret_struct = null,
+            .current_func_slf_slot = 0,
             .last_expr_type = .unknown,
             .last_stmt_had_value = false,
             .copy_depth = 0,
+            .expr_depth = 0,
+            .last_chain_recv = null,
         };
         c.cur = c.lexer.nextToken();
         c.peek = c.lexer.nextToken();
@@ -831,6 +857,7 @@ pub const Compiler = struct {
             .param_count = param_count,
         };
         self.func_ret_types[idx] = self.current_func_ret_type;
+        self.func_ret_structs[idx] = self.current_func_ret_struct;
         self.func_count += 1;
 
         for (self.call_fixups[0..self.call_fixup_count]) |*cf| {
@@ -863,6 +890,209 @@ pub const Compiler = struct {
             };
             self.call_fixup_count += 1;
             self.last_expr_type = .unknown;
+        }
+    }
+
+    fn methodReturnsSlf(self: *Compiler, m: StructDef.StructMethod, sname: []const u8) bool {
+        if (self.findFunc(m.func_name)) |fi| {
+            if (self.func_ret_structs[fi]) |rs| return std.mem.eql(u8, rs, sname);
+        }
+        return false;
+    }
+
+    // Re-emit the receiver (slf) argument push for a chained `: slf` call.
+    // Same codegen as the initial method-call receiver push; `slf` always
+    // aliases the original receiver object, so the static description stays valid.
+    fn emitRecvPush(self: *Compiler, recv: *SlfRecv) CompileError!void {
+        if (recv.is_param_ref) {
+            _ = try self.emit(.load_local, @intCast(recv.svar_base));
+            const adj: f64 = @floatFromInt(@as(i64, @intCast(recv.total_off)) - @as(i64, @intCast(self.local_count)));
+            if (adj != 0.0) {
+                _ = try self.emit(.push_num, @bitCast(adj));
+                _ = try self.emit(.add, 0);
+            }
+            recv.eff_valid = false;
+        } else {
+            var base_slot = recv.svar_base + recv.total_off;
+            if (recv.is_state) {
+                const sdef = self.findStructDef(recv.struct_name) orelse return error.UnknownType;
+                const tmp_base = self.local_count;
+                for (0..sdef.total_slots) |si| {
+                    _ = try self.addLocal("");
+                    _ = try self.emit(.load_state, @intCast(base_slot + si));
+                    _ = try self.emit(.store_local, @intCast(tmp_base + si));
+                }
+                base_slot = tmp_base;
+            }
+            recv.eff_base = base_slot;
+            recv.eff_valid = true;
+            recv.link_off = recv.total_off;
+            const rel_off: f64 = @floatFromInt(@as(i64, @intCast(base_slot)) - @as(i64, @intCast(self.local_count)));
+            _ = try self.emit(.push_num, @bitCast(rel_off));
+        }
+    }
+
+    // Single-slot field load for a chain ending on a field (`p.a().x`).
+    // Mirrors the plain field-load codegen in parsePrimary.
+    fn emitRecvField(self: *Compiler, recv: *SlfRecv) CompileError!void {
+        if (recv.is_param_ref) {
+            _ = try self.emit(.load_local, @intCast(recv.svar_base));
+            _ = try self.emit(.load_local_elem, @intCast(recv.total_off));
+        } else if (recv.is_state and !recv.eff_valid) {
+            _ = try self.emit(.load_state, @intCast(recv.svar_base + recv.total_off));
+        } else if (recv.eff_valid) {
+            _ = try self.emit(.load_local, @intCast(recv.eff_base + recv.total_off - recv.link_off));
+        } else {
+            _ = try self.emit(.load_local, @intCast(recv.svar_base + recv.total_off));
+        }
+    }
+
+    // Parse chained links after an `: slf` method call (`p.a().b()`, `p.a().x`).
+    // Called with cur positioned right after the initial call's `)`, with the
+    // returned offset on the stack top. Each link pops the previous offset and
+    // re-emits the receiver push (`slf` always aliases the original object),
+    // keeping the operand stack balanced.
+    fn maybeParseSlfChain(self: *Compiler, recv: SlfRecv, m: StructDef.StructMethod) CompileError!void {
+        if (self.cur.tag != .dot) return;
+        if (!self.methodReturnsSlf(m, recv.struct_name)) return;
+        var r = recv;
+        var cur_s = recv.struct_name;
+        var pending_field = false;
+        var pending_dt: DataType = .unknown;
+        var slf_on_stack = true;
+        while (self.cur.tag == .dot) {
+            self.advance();
+            if (self.cur.tag != .ident) return error.SyntaxError;
+            const fname = self.cur.text;
+            self.advance();
+            const sdef = self.findStructDef(cur_s) orelse return error.SyntaxError;
+            if (sdef.findMethod(fname)) |m2| {
+                if (self.cur.tag != .l_paren) return error.SyntaxError;
+                pending_field = false;
+                if (slf_on_stack) {
+                    _ = try self.emit(.pop, 0);
+                    slf_on_stack = false;
+                }
+                var call_arg_count: usize = 0;
+                if (m2.uses_slf) {
+                    try self.emitRecvPush(&r);
+                    call_arg_count += 1;
+                }
+                _ = self.match(.l_paren);
+                while (self.cur.tag != .r_paren and self.cur.tag != .eof) {
+                    try self.parseExpression();
+                    call_arg_count += 1;
+                    if (!self.match(.comma)) break;
+                }
+                if (!self.match(.r_paren)) return error.SyntaxError;
+                try self.emitCall(m2.func_name, call_arg_count);
+                if (!m2.uses_slf or !self.methodReturnsSlf(m2, cur_s)) {
+                    if (self.expr_depth == 1) self.last_chain_recv = null;
+                    return;
+                }
+                slf_on_stack = true;
+            } else if (sdef.findField(fname)) |f| {
+                r.total_off += f.offset;
+                pending_field = true;
+                pending_dt = f.data_type;
+                if (f.struct_name) |child| {
+                    cur_s = child;
+                    r.struct_name = child;
+                } else {
+                    if (self.cur.tag == .dot) return error.SyntaxError;
+                    break;
+                }
+            } else {
+                return error.UndefinedVariable;
+            }
+        }
+        if (pending_field) {
+            if (slf_on_stack) _ = try self.emit(.pop, 0);
+            try self.emitRecvField(&r);
+            self.last_expr_type = pending_dt;
+        }
+        if (self.expr_depth == 1) self.last_chain_recv = r;
+    }
+
+    // Read-only validation that cur starts a pure `: slf` call chain covering
+    // the whole RHS (`p.a().b()` followed by `;`/`}`/eof). Used by `let` to
+    // decide alias-vs-value *before* parsing. Never emits. Mirrors
+    // maybeParseSlfChain; anything rejected here falls back to the normal
+    // value path (existing errors preserved).
+    fn scanSlfChain(self: *Compiler) bool {
+        if (self.cur.tag != .ident) return false;
+        const svar = self.findStructVar(self.cur.text) orelse return false;
+        if (self.peek.tag != .dot) return false;
+        var lx = self.lexer;
+        var c = self.cur;
+        var p = self.peek;
+        var cur_s: []const u8 = svar.struct_name;
+        var last_link_call = false;
+        while (p.tag == .dot) {
+            c = p;
+            p = lx.nextToken(); // c == dot
+            c = p;
+            p = lx.nextToken(); // c == ident?
+            if (c.tag != .ident) return false;
+            const fname = c.text;
+            const sdef = self.findStructDef(cur_s) orelse return false;
+            if (p.tag == .l_paren) {
+                const m = sdef.findMethod(fname) orelse return false;
+                if (!m.uses_slf) return false;
+                if (!self.methodReturnsSlf(m, cur_s)) return false;
+                c = p;
+                p = lx.nextToken(); // c == '('
+                var depth: usize = 1;
+                while (depth > 0) {
+                    c = p;
+                    p = lx.nextToken();
+                    if (c.tag == .eof) return false;
+                    if (c.tag == .l_paren or c.tag == .l_brace or c.tag == .l_bracket) {
+                        depth += 1;
+                    } else if (c.tag == .r_paren or c.tag == .r_brace or c.tag == .r_bracket) {
+                        depth -= 1;
+                    }
+                }
+                // c == matching r_paren
+                last_link_call = true;
+            } else {
+                const f = sdef.findField(fname) orelse return false;
+                if (f.struct_name) |child| {
+                    cur_s = child;
+                } else {
+                    return false; // scalar field ending -> value path
+                }
+                last_link_call = false;
+            }
+        }
+        if (!last_link_call) return false;
+        return p.tag == .semicolon or p.tag == .r_brace or p.tag == .eof;
+    }
+
+    // Bind `name` as a reference alias to a `: slf` chain result.
+    // `slf` always aliases the receiver object, so this is equivalent to
+    // aliasing the (possibly nested) receiver itself. Stack top (the
+    // returned offset) must already be popped by the caller.
+    fn aliasChainResult(self: *Compiler, name: []const u8, rcv: SlfRecv) CompileError!void {
+        if (rcv.is_param_ref and rcv.total_off != 0) {
+            // Materialize the effective base into a temp: nested refs under a
+            // param receiver have no static slot to alias.
+            const tmp = try self.addLocal("");
+            _ = try self.emit(.load_local, @intCast(rcv.svar_base));
+            const off: f64 = @floatFromInt(@as(i64, @intCast(rcv.total_off)));
+            _ = try self.emit(.push_num, @bitCast(off));
+            _ = try self.emit(.add, 0);
+            _ = try self.emit(.store_local, @intCast(tmp));
+            try self.addStructVar(name, rcv.struct_name, tmp, false, true);
+            self.struct_vars[self.struct_var_count - 1].is_param_ref = true;
+        } else if (rcv.is_param_ref) {
+            try self.addStructVar(name, rcv.struct_name, rcv.svar_base, false, true);
+            self.struct_vars[self.struct_var_count - 1].is_param_ref = true;
+        } else if (rcv.is_state) {
+            if (!rcv.eff_valid) return error.SyntaxError;
+            try self.addStructVar(name, rcv.struct_name, rcv.eff_base, false, false);
+        } else {
+            try self.addStructVar(name, rcv.struct_name, rcv.svar_base + rcv.total_off, false, true);
         }
     }
 
@@ -1181,6 +1411,10 @@ pub const Compiler = struct {
                 dt = .str;
             } else if (self.findStructDef(tname) != null) {
                 sname_annot = tname;
+            } else if (std.mem.eql(u8, tname, "slf")) {
+                // `slf` return type: resolved to the receiver struct in
+                // parseFuncInternal; rejected everywhere else (UnknownType).
+                sname_annot = "slf";
             } else {
                 return error.UnknownType;
             }
@@ -1897,7 +2131,26 @@ pub const Compiler = struct {
         const saved_func_name = self.current_func_name;
         self.current_func_name = full_name;
 
-        var uses_slp = false;
+        var uses_slf = false;
+        var ret_is_slf = false;
+        {
+            // Lookahead for `: slf` return type: params are parsed before the
+            // return annotation, but slf injection must be decided first.
+            var lx = self.lexer;
+            var c = self.cur;
+            var p = self.peek;
+            var depth: usize = 1; // already consumed '('
+            while (depth > 0) {
+                if (c.tag == .eof) break;
+                if (c.tag == .l_paren) depth += 1 else if (c.tag == .r_paren) depth -= 1;
+                c = p;
+                p = lx.nextToken();
+            }
+            if (depth == 0 and c.tag == .colon and p.tag == .ident and std.mem.eql(u8, p.text, "slf")) {
+                ret_is_slf = true;
+            }
+        }
+        if (ret_is_slf and receiver_struct != null) uses_slf = true;
         if (receiver_struct != null) {
             var scan_lexer = self.lexer;
             var brace_depth: usize = 0;
@@ -1911,8 +2164,8 @@ pub const Compiler = struct {
                 } else if (tok.tag == .r_brace) {
                     if (brace_depth > 0) brace_depth -= 1;
                     if (brace_depth == 0 and in_body) break;
-                } else if (tok.tag == .ident and std.mem.eql(u8, tok.text, "slp")) {
-                    uses_slp = true;
+                } else if (tok.tag == .ident and std.mem.eql(u8, tok.text, "slf")) {
+                    uses_slf = true;
                     break;
                 }
             }
@@ -1924,8 +2177,8 @@ pub const Compiler = struct {
         var param_consts: [8]bool = @splat(false);
         var param_annots: [8]?TypeAnnotation = @splat(null);
 
-        if (uses_slp) {
-            param_names[0] = "slp";
+        if (uses_slf) {
+            param_names[0] = "slf";
             param_types[0] = .unknown;
             param_consts[0] = false;
             param_annots[0] = TypeAnnotation{
@@ -1954,8 +2207,24 @@ pub const Compiler = struct {
         }
         _ = self.match(.r_paren);
         const ret_annot = try self.parseTypeAnnotation();
+        var ret_struct: ?[]const u8 = null;
+        if (ret_annot) |a| {
+            if (a.struct_name) |sn| {
+                if (std.mem.eql(u8, sn, "slf")) {
+                    if (receiver_struct == null) return error.UnknownType;
+                    ret_is_slf = true;
+                    ret_struct = receiver_struct.?;
+                } else {
+                    ret_struct = sn;
+                }
+            }
+        }
         const saved_func_ret_type = self.current_func_ret_type;
         self.current_func_ret_type = if (ret_annot) |a| a.data_type else .unknown;
+        const saved_func_ret_is_slf = self.current_func_ret_is_slf;
+        self.current_func_ret_is_slf = ret_is_slf;
+        const saved_func_ret_struct = self.current_func_ret_struct;
+        self.current_func_ret_struct = ret_struct;
 
         const skip_jmp = try self.emit(.jmp, 0);
         const entry_ip = self.op_count;
@@ -1964,7 +2233,7 @@ pub const Compiler = struct {
 
         if (receiver_struct) |rs| {
             if (self.findStructDefPtr(rs)) |sdef_ptr| {
-                try sdef_ptr.addMethod(method_name, full_name, uses_slp);
+                try sdef_ptr.addMethod(method_name, full_name, uses_slf);
             }
         }
 
@@ -2021,6 +2290,10 @@ pub const Compiler = struct {
             }
         }
 
+        // slf is always stored last, so its slot is local_count - 1.
+        const saved_func_slf_slot = self.current_func_slf_slot;
+        self.current_func_slf_slot = if (uses_slf) self.local_count - 1 else 0;
+
         if (self.match(.arrow)) {
             try self.parseExpression();
             if (self.current_func_ret_type != .unknown and self.last_expr_type != .unknown and self.current_func_ret_type != self.last_expr_type) {
@@ -2031,7 +2304,10 @@ pub const Compiler = struct {
             self.current_func_had_ret = false;
             _ = try self.parseBlock();
             if (!self.current_func_had_ret) {
-                if (receiver_struct != null) {
+                if (self.current_func_ret_is_slf) {
+                    _ = try self.emit(.load_local, @intCast(self.current_func_slf_slot));
+                    _ = try self.emit(.ret, 0);
+                } else if (receiver_struct != null) {
                     _ = try self.emit(.push_0, 0);
                     _ = try self.emit(.ret, 0);
                 } else {
@@ -2046,6 +2322,9 @@ pub const Compiler = struct {
 
         self.current_func_name = saved_func_name;
         self.current_func_ret_type = saved_func_ret_type;
+        self.current_func_ret_is_slf = saved_func_ret_is_slf;
+        self.current_func_ret_struct = saved_func_ret_struct;
+        self.current_func_slf_slot = saved_func_slf_slot;
         self.array_count = saved_arrays;
         self.struct_var_count = saved_struct_vars;
         self.locals = saved_locals;
@@ -2063,6 +2342,7 @@ pub const Compiler = struct {
 
     fn parseStatement(self: *Compiler) CompileError!void {
         self.last_stmt_had_value = false;
+        self.last_chain_recv = null;
         if (self.match(.kw_jmp)) {
             _ = try self.parseJmp(false);
             return;
@@ -2125,6 +2405,12 @@ pub const Compiler = struct {
             self.advance();
             const annot = try self.parseTypeAnnotation();
             if (annot) |a| {
+                if (a.struct_name) |sn| {
+                    // `: slf` is only valid as a method return type.
+                    if (std.mem.eql(u8, sn, "slf")) return error.UnknownType;
+                }
+            }
+            if (annot) |a| {
                 if (a.struct_name) |sname| {
                     const sdef = self.findStructDef(sname) orelse return error.UnknownType;
                     if (self.match(.equal)) {
@@ -2137,12 +2423,12 @@ pub const Compiler = struct {
                             if (!self.match(.pipe)) return error.SyntaxError;
                             _ = self.match(.semicolon);
                             const base_slot = self.local_count;
-                            for (0..sdef.field_count) |fi| {
+                            for (0..sdef.total_slots) |fi| {
                                 const s = try self.addLocal("");
-                                self.local_types[s] = sdef.fields[fi].data_type;
+                                self.local_types[s] = if (fi < sdef.field_count) sdef.fields[fi].data_type else .num;
                             }
                             try self.addStructVar(name, sname, base_slot, false, false);
-                            for (0..sdef.field_count) |fi| {
+                            for (0..sdef.total_slots) |fi| {
                                 if (src.is_state) {
                                     _ = try self.emit(.load_state, @intCast(src.base_slot + fi));
                                 } else {
@@ -2159,22 +2445,31 @@ pub const Compiler = struct {
                             _ = self.match(.semicolon);
                             try self.addStructVar(name, sname, src.base_slot, src.is_state, true);
                             return;
+                        } else if (self.cur.tag == .ident and self.findStructVar(self.cur.text) != null and self.peek.tag == .dot and self.scanSlfChain()) {
+                            // `let q: S = p.a().b();` — q aliases the receiver.
+                            try self.parseExpression();
+                            const rcv = self.last_chain_recv orelse return error.SyntaxError;
+                            if (!std.mem.eql(u8, rcv.struct_name, sname)) return error.TypeMismatch;
+                            _ = try self.emit(.pop, 0);
+                            try self.aliasChainResult(name, rcv);
+                            _ = self.match(.semicolon);
+                            return;
                         }
                         const base_slot = self.local_count;
-                        for (0..sdef.field_count) |fi| {
+                        for (0..sdef.total_slots) |fi| {
                             const s = try self.addLocal("");
-                            self.local_types[s] = sdef.fields[fi].data_type;
+                            self.local_types[s] = if (fi < sdef.field_count) sdef.fields[fi].data_type else .num;
                         }
                         try self.addStructVar(name, sname, base_slot, false, false);
                         try self.parseStructInit(sdef, base_slot, false, true);
                     } else {
                         const base_slot = self.local_count;
-                        for (0..sdef.field_count) |fi| {
+                        for (0..sdef.total_slots) |fi| {
                             const s = try self.addLocal("");
-                            self.local_types[s] = sdef.fields[fi].data_type;
+                            self.local_types[s] = if (fi < sdef.field_count) sdef.fields[fi].data_type else .num;
                         }
                         try self.addStructVar(name, sname, base_slot, false, false);
-                        for (0..sdef.field_count) |fi| {
+                        for (0..sdef.total_slots) |fi| {
                             const slot = base_slot + fi;
                             _ = try self.emit(.push_0, 0);
                             _ = try self.emit(.store_local, @intCast(slot));
@@ -2194,12 +2489,12 @@ pub const Compiler = struct {
                         if (!self.match(.pipe)) return error.SyntaxError;
                         _ = self.match(.semicolon);
                         const base_slot = self.local_count;
-                        for (0..sdef.field_count) |fi| {
+                        for (0..sdef.total_slots) |fi| {
                             const s = try self.addLocal("");
-                            self.local_types[s] = sdef.fields[fi].data_type;
+                            self.local_types[s] = if (fi < sdef.field_count) sdef.fields[fi].data_type else .num;
                         }
                         try self.addStructVar(name, src.struct_name, base_slot, false, false);
-                        for (0..sdef.field_count) |fi| {
+                        for (0..sdef.total_slots) |fi| {
                             if (src.is_state) {
                                 _ = try self.emit(.load_state, @intCast(src.base_slot + fi));
                             } else {
@@ -2225,13 +2520,22 @@ pub const Compiler = struct {
                     try self.addStructVar(name, src.struct_name, src.base_slot, src.is_state, true);
                     return;
                 }
+                if (self.cur.tag == .ident and self.findStructVar(self.cur.text) != null and self.peek.tag == .dot and self.scanSlfChain()) {
+                    // `let q = p.a().b();` — q aliases the receiver.
+                    try self.parseExpression();
+                    const rcv = self.last_chain_recv orelse return error.SyntaxError;
+                    _ = try self.emit(.pop, 0);
+                    try self.aliasChainResult(name, rcv);
+                    _ = self.match(.semicolon);
+                    return;
+                }
                 if (self.cur.tag == .ident and self.findStructDef(self.cur.text) != null and self.peek.tag == .l_brace) {
                     const sname = self.cur.text;
                     const sdef = self.findStructDef(sname).?;
                     const base_slot = self.local_count;
-                    for (0..sdef.field_count) |fi| {
+                    for (0..sdef.total_slots) |fi| {
                         const s = try self.addLocal("");
-                        self.local_types[s] = sdef.fields[fi].data_type;
+                        self.local_types[s] = if (fi < sdef.field_count) sdef.fields[fi].data_type else .num;
                     }
                     try self.addStructVar(name, sname, base_slot, false, false);
                     try self.parseStructInit(sdef, base_slot, false, true);
@@ -2284,12 +2588,17 @@ pub const Compiler = struct {
             self.advance();
             const annot = try self.parseTypeAnnotation();
             if (annot) |a| {
+                if (a.struct_name) |sn| {
+                    if (std.mem.eql(u8, sn, "slf")) return error.UnknownType;
+                }
+            }
+            if (annot) |a| {
                 if (a.struct_name) |sname| {
                     const sdef = self.findStructDef(sname) orelse return error.UnknownType;
                     const base_slot = self.state_count;
-                    for (0..sdef.field_count) |fi| {
+                    for (0..sdef.total_slots) |fi| {
                         const s = try self.addState("");
-                        self.state_types[s] = sdef.fields[fi].data_type;
+                        self.state_types[s] = if (fi < sdef.field_count) sdef.fields[fi].data_type else .num;
                     }
                     try self.addStructVar(name, sname, base_slot, true, false);
 
@@ -2305,9 +2614,9 @@ pub const Compiler = struct {
                     const sname = self.cur.text;
                     const sdef = self.findStructDef(sname).?;
                     const base_slot = self.state_count;
-                    for (0..sdef.field_count) |fi| {
+                    for (0..sdef.total_slots) |fi| {
                         const s = try self.addState("");
-                        self.state_types[s] = sdef.fields[fi].data_type;
+                        self.state_types[s] = if (fi < sdef.field_count) sdef.fields[fi].data_type else .num;
                     }
                     try self.addStructVar(name, sname, base_slot, true, false);
                     try self.parseStructInit(sdef, base_slot, true, true);
@@ -2366,6 +2675,11 @@ pub const Compiler = struct {
             const name = self.cur.text;
             self.advance();
             const annot = try self.parseTypeAnnotation();
+            if (annot) |a| {
+                if (a.struct_name) |sn| {
+                    if (std.mem.eql(u8, sn, "slf")) return error.UnknownType;
+                }
+            }
             _ = self.match(.equal);
 
             if (self.match(.at)) {
@@ -2483,10 +2797,15 @@ pub const Compiler = struct {
                     return error.TypeMismatch;
                 }
             } else {
-                if (self.current_func_ret_type != .unknown and self.current_func_ret_type != .num) {
-                    return error.TypeMismatch;
+                if (self.current_func_ret_is_slf) {
+                    // Bare `ret;` inside an `: slf` method returns the receiver.
+                    _ = try self.emit(.load_local, @intCast(self.current_func_slf_slot));
+                } else {
+                    if (self.current_func_ret_type != .unknown and self.current_func_ret_type != .num) {
+                        return error.TypeMismatch;
+                    }
+                    _ = try self.emit(.push_0, 0);
                 }
-                _ = try self.emit(.push_0, 0);
             }
             _ = try self.emit(.ret, 0);
             _ = self.match(.semicolon);
@@ -3207,6 +3526,8 @@ pub const Compiler = struct {
     }
 
     pub fn parseExpression(self: *Compiler) CompileError!void {
+        self.expr_depth += 1;
+        defer self.expr_depth -= 1;
         try self.parseTernary();
     }
 
@@ -3560,29 +3881,16 @@ pub const Compiler = struct {
                     }
 
                     const m = method_info.?;
+                    var recv = SlfRecv{
+                        .struct_name = curr_sdef.name,
+                        .svar_base = svar.base_slot,
+                        .total_off = total_offset,
+                        .is_param_ref = svar.is_param_ref,
+                        .is_state = svar.is_state,
+                    };
                     var call_arg_count: usize = 0;
-                    if (m.uses_slp) {
-                        if (svar.is_param_ref) {
-                            _ = try self.emit(.load_local, @intCast(svar.base_slot));
-                            const adj: f64 = @floatFromInt(@as(i64, @intCast(total_offset)) - @as(i64, @intCast(self.local_count)));
-                            if (adj != 0.0) {
-                                _ = try self.emit(.push_num, @bitCast(adj));
-                                _ = try self.emit(.add, 0);
-                            }
-                        } else {
-                            var base_slot = svar.base_slot + total_offset;
-                            if (svar.is_state) {
-                                const tmp_base = self.local_count;
-                                for (0..curr_sdef.total_slots) |si| {
-                                    _ = try self.addLocal("");
-                                    _ = try self.emit(.load_state, @intCast(base_slot + si));
-                                    _ = try self.emit(.store_local, @intCast(tmp_base + si));
-                                }
-                                base_slot = tmp_base;
-                            }
-                            const rel_off: f64 = @floatFromInt(@as(i64, @intCast(base_slot)) - @as(i64, @intCast(self.local_count)));
-                            _ = try self.emit(.push_num, @bitCast(rel_off));
-                        }
+                    if (m.uses_slf) {
+                        try self.emitRecvPush(&recv);
                         call_arg_count += 1;
                     }
 
@@ -3595,6 +3903,10 @@ pub const Compiler = struct {
                     if (!self.match(.r_paren)) return error.SyntaxError;
 
                     try self.emitCall(m.func_name, call_arg_count);
+                    if (self.expr_depth == 1 and m.uses_slf and self.methodReturnsSlf(m, recv.struct_name)) {
+                        self.last_chain_recv = recv;
+                    }
+                    try self.maybeParseSlfChain(recv, m);
                     return;
                 }
             }

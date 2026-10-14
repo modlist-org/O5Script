@@ -1108,17 +1108,17 @@ test "lop inclusive range 0..=10 vs half-open 0..10" {
     try std.testing.expectEqual(@as(f64, 4555.0), res.num);
 }
 
-test "stu methods with slp and state mutation" {
+test "stu methods with slf and state mutation" {
     const allocator = std.testing.allocator;
     const src =
         \\stu Counter {
         \\    val: num,
         \\    step: num,
         \\    add() {
-        \\        slp.val += slp.step;
+        \\        slf.val += slf.step;
         \\    },
         \\    get(): num {
-        \\        ret slp.val;
+        \\        ret slf.val;
         \\    }
         \\}
         \\let c = Counter { val: 10, step: 5 };
@@ -1133,7 +1133,7 @@ test "stu methods with slp and state mutation" {
     try std.testing.expectEqual(@as(f64, 20.0), res.num);
 }
 
-test "stu methods without slp and external method definition" {
+test "stu methods without slf and external method definition" {
     const allocator = std.testing.allocator;
     const src =
         \\stu Point {
@@ -1144,8 +1144,8 @@ test "stu methods without slp and external method definition" {
         \\    }
         \\}
         \\fun Point.translate(dx: num, dy: num) {
-        \\    slp.x += dx;
-        \\    slp.y += dy;
+        \\    slf.x += dx;
+        \\    slf.y += dy;
         \\}
         \\let pt = Point { x: 3, y: 4 };
         \\let d = pt.dist_sq_zero(pt.x, pt.y);
@@ -1160,20 +1160,20 @@ test "stu methods without slp and external method definition" {
     try std.testing.expectEqual(@as(f64, 2510.0), res.num);
 }
 
-test "stu chained methods and slp calling another method" {
+test "stu chained methods and slf calling another method" {
     const allocator = std.testing.allocator;
     const src =
         \\stu SubEngine {
         \\    power: num,
         \\    boost() {
-        \\        slp.power += 10;
+        \\        slf.power += 10;
         \\    }
         \\}
         \\stu Car {
         \\    engine: SubEngine,
         \\    turbo() {
-        \\        slp.engine.boost();
-        \\        slp.engine.boost();
+        \\        slf.engine.boost();
+        \\        slf.engine.boost();
         \\    }
         \\}
         \\let c = Car { engine: SubEngine { power: 100 } };
@@ -1187,5 +1187,219 @@ test "stu chained methods and slp calling another method" {
     const res = try vm.run(prog, 0, &[_]f64{});
     // 100 + 10 (boost) + 20 (turbo) = 130
     try std.testing.expectEqual(@as(f64, 130.0), res.num);
+}
+
+test "slf return with explicit ret slf and chaining" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Point {
+        \\    x: num,
+        \\    y: num,
+        \\    move(dx: num, dy: num): slf {
+        \\        slf.x += dx;
+        \\        slf.y += dy;
+        \\        ret slf;
+        \\    }
+        \\}
+        \\let p = Point { x: 1, y: 2 };
+        \\p.move(10, 20).move(100, 200);
+        \\p.x + p.y
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // x = 111, y = 222
+    try std.testing.expectEqual(@as(f64, 333.0), res.num);
+}
+
+test "slf implicit return and bare ret" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Counter {
+        \\    val: num,
+        \\    add(n: num): slf {
+        \\        slf.val += n;
+        \\    },
+        \\    add2(n: num): slf {
+        \\        slf.val += n;
+        \\        ret;
+        \\    }
+        \\}
+        \\let c = Counter { val: 0 };
+        \\c.add(5).add2(7).add(3);
+        \\c.val
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 15.0), res.num);
+}
+
+test "slf let alias" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Point {
+        \\    x: num,
+        \\    y: num,
+        \\    move(dx: num, dy: num): slf {
+        \\        slf.x += dx;
+        \\        slf.y += dy;
+        \\        ret slf;
+        \\    }
+        \\}
+        \\let p = Point { x: 1, y: 2 };
+        \\let q = p.move(10, 20);
+        \\q.x = 99;
+        \\p.x + p.y
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // q aliases p: p.x = 99, p.y = 22
+    try std.testing.expectEqual(@as(f64, 121.0), res.num);
+}
+
+test "slf annotated let alias and field after call" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Point {
+        \\    x: num,
+        \\    y: num,
+        \\    move(dx: num, dy: num): slf {
+        \\        slf.x += dx;
+        \\        slf.y += dy;
+        \\        ret slf;
+        \\    }
+        \\}
+        \\let p = Point { x: 0, y: 0 };
+        \\let q: Point = p.move(3, 4).move(1, 1);
+        \\q.x + q.y + p.move(0, 0).x
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // q aliases p: x = 4, y = 5; p.move(0,0).x = 4
+    try std.testing.expectEqual(@as(f64, 13.0), res.num);
+}
+
+test "slf external method and slf-internal chain" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Engine {
+        \\    power: num,
+        \\    boost(n: num): slf {
+        \\        slf.power += n;
+        \\        ret slf;
+        \\    }
+        \\}
+        \\stu Car {
+        \\    engine: Engine,
+        \\    turbo(): slf {
+        \\        slf.engine.boost(10).boost(20);
+        \\        ret slf;
+        \\    }
+        \\}
+        \\fun Engine.over(n: num): slf {
+        \\    slf.power += n;
+        \\    ret slf;
+        \\}
+        \\let c = Car { engine: Engine { power: 100 } };
+        \\c.turbo().turbo();
+        \\c.engine.over(5).over(5);
+        \\c.engine.power
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 100 + 30 + 30 + 5 + 5 = 170
+    try std.testing.expectEqual(@as(f64, 170.0), res.num);
+}
+
+test "slf chain in loop stays stack-balanced" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu P {
+        \\    x: num,
+        \\    bump(n: num): slf {
+        \\        slf.x += n;
+        \\        ret slf;
+        \\    }
+        \\}
+        \\let p = P { x: 0 };
+        \\lop 300 {
+        \\    p.bump(1).bump(2);
+        \\}
+        \\p.x
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 900.0), res.num);
+}
+
+test "nested multi-slot struct frame allocation" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\stu Point {
+        \\    x: num,
+        \\    y: num,
+        \\    move(dx: num, dy: num): slf {
+        \\        slf.x += dx;
+        \\        slf.y += dy;
+        \\        ret slf;
+        \\    }
+        \\}
+        \\stu Car {
+        \\    engine: Point,
+        \\    run(n: num): slf {
+        \\        slf.engine.move(n, n);
+        \\        ret slf;
+        \\    }
+        \\}
+        \\let c = Car { engine: Point { x: 0, y: 0 } };
+        \\c.run(5).run(3);
+        \\c.engine.x + c.engine.y
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 16.0), res.num);
+}
+
+test "slf compile errors" {
+    const allocator = std.testing.allocator;
+    // slf outside a stu method
+    try std.testing.expectError(error.UnknownType, compiler.compileSource(
+        \\fun f(): slf {
+        \\    ret 0;
+        \\}
+    , allocator));
+    // slf as variable annotation
+    try std.testing.expectError(error.UnknownType, compiler.compileSource(
+        \\let x: slf = 1;
+    , allocator));
+    // chaining onto a num-returning method
+    try std.testing.expectError(error.SyntaxError, compiler.compileSource(
+        \\stu Point {
+        \\    x: num,
+        \\    y: num,
+        \\    get(): num {
+        \\        ret slf.x;
+        \\    },
+        \\    move(dx: num, dy: num): slf {
+        \\        slf.x += dx;
+        \\        ret slf;
+        \\    }
+        \\}
+        \\let p = Point { x: 1, y: 2 };
+        \\p.get().move(1, 1);
+    , allocator));
 }
 

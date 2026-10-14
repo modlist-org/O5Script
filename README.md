@@ -8,8 +8,8 @@ Ultra-fast, zero-allocation, compiled scripting language designed for in-game HU
 
 - **Zero-Heap Core**: Fixed-size stack-allocated arrays (`[3]num`, `[2][2]num`), flat contiguous structs (`stu`), and bounded strings (`max_str_len = 256`, 16-byte Fat Pointers). 0 byte GC/heap overhead on evaluation hot paths.
 - **Zero-Cost Structures & Methods (`stu`)**:
-  - Member methods with automatic `slp` (self) detection & stack relative offset passing (pass-by-reference).
-  - Pure static helper methods compiled with 0 overhead when `slp` is unused.
+  - Member methods with automatic `slf` (self) detection & stack relative offset passing (pass-by-reference).
+  - Pure static helper methods compiled with 0 overhead when `slf` is unused.
   - Value vs Reference semantics: Default pass-by-reference (`a = b`) and explicit deep copy syntax (`a = |b|`, `fun f(a: |Point|)`).
   - Compile-time escape analysis (`LifetimeError`).
 - **Control Flow & Pattern Matching**:
@@ -51,17 +51,17 @@ Tested on Linux x86_64 against native Zig compiled with `-OReleaseFast` (LLVM -O
 con Math = @("std.math");
 sta counter = 0;
 
-// Struct with member methods (slp is automatically detected & passed by reference)
+// Struct with member methods (slf is automatically detected & passed by reference)
 stu Counter {
     val: num,
     step: num,
 
     add() {
-        slp.val += slp.step;
+        slf.val += slf.step;
     },
 
     get(): num {
-        ret slp.val;
+        ret slf.val;
     }
 }
 

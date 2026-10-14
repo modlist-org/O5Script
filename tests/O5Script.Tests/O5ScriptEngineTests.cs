@@ -310,5 +310,27 @@ public class O5ScriptEngineTests {
         double result = O5ScriptEngine.EvalNum("(5 & 3) + (4 | 2) + (10 ^ 6) + (1 << 3) + (16 >> 2)");
         Assert.Equal(31.0, result);
     }
+
+    [Fact]
+    public void Struct_SlfChainingAndAlias() {
+        string src = """
+        stu Point {
+            x: num,
+            y: num,
+            move(dx: num, dy: num): slf {
+                slf.x += dx;
+                slf.y += dy;
+                ret slf;
+            }
+        }
+        let p = Point { x: 1, y: 2 };
+        p.move(10, 20).move(100, 200);
+        let q = p.move(1, 1);
+        q.x = 0;
+        p.x + p.y
+        """;
+        double result = O5ScriptEngine.EvalNum(src);
+        Assert.Equal(223.0, result); // x: 112 -> 0 (aliased), y: 223
+    }
 }
 
