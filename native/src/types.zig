@@ -112,6 +112,22 @@ pub const OpCode = enum(u8) {
     inc_local,
     dec_local,
     table_jmp,
+
+    // Superinstructions written by vm.fuse over an op and the next one(s). The
+    // fused-over ops stay in place, so jumps into them still work unchanged.
+    add_k, // push K; add
+    sub_k, // push K; sub
+    mul_k, // push K; mul
+    div_k, // push K; div
+    lt_jz, // lt; jmp_if_zero T
+    le_jz,
+    gt_jz,
+    ge_jz,
+    lt_k_jz, // push K; lt; jmp_if_zero T
+    le_k_jz,
+    gt_k_jz,
+    ge_k_jz,
+    load_local2, // load_local A; load_local B
 };
 
 pub const Op = extern struct {

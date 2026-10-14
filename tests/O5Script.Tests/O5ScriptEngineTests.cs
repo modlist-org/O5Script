@@ -428,5 +428,26 @@ public class O5ScriptEngineTests {
         Assert.True(double.IsNaN(bad));
         Assert.Equal("assert failed: boom\n", O5ScriptEngine.DrainDebugOutput());
     }
-}
 
+    [Fact]
+    public void RepeatedResults_ReuseTextButNeverGoStale() {
+        using var prog = O5ScriptEngine.Compile("""
+        sta n = 0;
+        n += 1;
+        if n < 3 { "same" } el { "changed " + #Score }
+        """);
+        string first = prog.ExecuteString([1]);
+        Assert.Equal("same", first);
+        Assert.Same(first, prog.ExecuteString([1]));
+        Assert.Equal("changed 7", prog.ExecuteString([7]));
+        Assert.Equal("changed 8", prog.ExecuteString([8]));
+
+        using var num = O5ScriptEngine.Compile("#X * 2");
+        string four = num.ExecuteString([2]);
+        Assert.Equal("4", four);
+        Assert.Same(four, num.ExecuteString([2]));
+        Assert.Equal("-0", num.ExecuteString([-0.0]));
+        Assert.Equal("0", num.ExecuteString([0.0]));
+        Assert.Equal(O5Value.FromStr("same").ToString(), "same");
+    }
+}

@@ -11,12 +11,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .strip = true,
     });
-    mod.addAssemblyFile(b.path("src/vm_x86_64.S"));
 
     const lib = b.addLibrary(.{
         .name = "o5script",
         .root_module = mod,
         .linkage = .dynamic,
+        .use_llvm = true,
     });
     b.installArtifact(lib);
 
@@ -27,12 +27,25 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .strip = true,
     });
-    exe_mod.addAssemblyFile(b.path("src/vm_x86_64.S"));
     const exe = b.addExecutable(.{
         .name = "o5s",
         .root_module = exe_mod,
+        .use_llvm = true,
     });
     b.installArtifact(exe);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "o5s-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+        }),
+        .use_llvm = true,
+    });
+    const bench_step = b.step("bench", "Run VM benchmarks (ReleaseFast)");
+    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
 
     const test_step = b.step("test", "Run unit tests");
     const test_mod = b.createModule(.{
@@ -41,10 +54,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    test_mod.addAssemblyFile(b.path("src/vm_x86_64.S"));
     const unit_tests = b.addTest(.{
         .name = "o5script-test",
         .root_module = test_mod,
+        .use_llvm = true,
     });
     const run_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_tests.step);

@@ -565,7 +565,7 @@ $loop_end
 
 ## 13. Performance & Architecture
 
-- **Hardware Register Mapping**: The VM interpreter (`vm_x86_64.S`) anchors bytecode execution in dedicated x86_64 CPU registers (`r12` = Instruction Pointer, `r11` = Evaluation Stack Base, `r10` = Evaluation Stack Pointer, `rbx` = Local Frame Pointer).
+- **Portable Interpreter**: The VM (`native/src/vm.zig`) is plain Zig compiled through the LLVM backend (`use_llvm = true`), so it builds on any LLVM target (x86_64, arm64, ...).
 - **Zero Heap / Zero GC**: All local variables, arrays, structs, and strings reside on contiguous stack memory or fixed buffers.
 - **Micro-benchmark Comparison (AMD/Intel x86_64)**:
   - 100M Loop: **O5Script 209 ms** vs **Native Zig 212 ms** (O5Script is ~1% faster due to direct register-fused loop step).

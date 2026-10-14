@@ -1294,6 +1294,9 @@ pub const Compiler = struct {
                 .halt => delta = 0,
                 .loop_step, .add_local, .inc_local, .dec_local => delta = 0,
                 .table_jmp => delta = -1,
+                // Written by vm.fuse after compile; never present here.
+                .add_k, .sub_k, .mul_k, .div_k, .lt_jz, .le_jz, .gt_jz, .ge_jz,
+                .lt_k_jz, .le_k_jz, .gt_k_jz, .ge_k_jz, .load_local2 => unreachable,
             }
 
             const next_depth = current_depth + delta;
@@ -4708,5 +4711,7 @@ pub const Compiler = struct {
 
 pub fn compileSource(src: []const u8, allocator: std.mem.Allocator) CompileError!*Prog {
     var c = Compiler.init(src, allocator);
-    return try c.compile();
+    const prog = try c.compile();
+    vm.fuse(prog);
+    return prog;
 }

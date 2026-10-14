@@ -17,6 +17,99 @@ pub const max_calls: usize = 64;
 pub const max_steps: usize = 1_000_000;
 
 threadlocal var thread_scratch: [65536]u8 = undefined;
+// Locals persist per thread and are all-zero between runs: each run re-zeroes
+// only the region it could have dirtied, instead of clearing all 512 slots up
+// front. vm.run is never re-entered on one thread (no host callbacks).
+threadlocal var thread_locals: [max_locals]Value = std.mem.zeroes([max_locals]Value);
+
+fn concat(scratch: []u8, scratch_pos: *usize, l: Value, r: Value) EvalError!Value {
+    const start_pos = scratch_pos.*;
+    if (l.val_type == .str) {
+        try appendString(scratch, scratch_pos, l.toSlice());
+    } else {
+        try appendNumber(scratch, scratch_pos, l.num);
+    }
+    if (r.val_type == .str) {
+        try appendString(scratch, scratch_pos, r.toSlice());
+    } else {
+        try appendNumber(scratch, scratch_pos, r.num);
+    }
+    const len = scratch_pos.* - start_pos;
+    if (len > types.max_str_len) return EvalError.StringTooLong;
+    return Value.fromStr(scratch[start_pos .. start_pos + len]);
+}
+
+/// Rewrites common op sequences into superinstructions in place. Each fused
+/// op does exactly what the original sequence did (including step counts and
+/// stack checks) and skips the ops it absorbed, which stay valid jump targets.
+pub fn fuse(prog: *Prog) void {
+    const ops = prog.ops;
+    var i: usize = 0;
+    while (i + 1 < ops.len) : (i += 1) {
+        const next = ops[i + 1].code;
+        const k: ?f64 = switch (ops[i].code) {
+            .push_num => @bitCast(ops[i].arg),
+            .push_0 => 0.0,
+            .push_1 => 1.0,
+            else => null,
+        };
+        if (k) |constant| {
+            const k_bits: i64 = @bitCast(constant);
+            if (i + 2 < ops.len and ops[i + 2].code == .jmp_if_zero) {
+                const fused: ?OpCode = switch (next) {
+                    .lt => .lt_k_jz,
+                    .le => .le_k_jz,
+                    .gt => .gt_k_jz,
+                    .ge => .ge_k_jz,
+                    else => null,
+                };
+                if (fused) |code| {
+                    ops[i] = .{ .code = code, .arg = k_bits };
+                    continue;
+                }
+            }
+            const fused: ?OpCode = switch (next) {
+                .add => .add_k,
+                .sub => .sub_k,
+                .mul => .mul_k,
+                .div => .div_k,
+                else => null,
+            };
+            if (fused) |code| ops[i] = .{ .code = code, .arg = k_bits };
+            continue;
+        }
+        switch (ops[i].code) {
+            .lt, .le, .gt, .ge => if (next == .jmp_if_zero) {
+                ops[i].code = switch (ops[i].code) {
+                    .lt => .lt_jz,
+                    .le => .le_jz,
+                    .gt => .gt_jz,
+                    else => .ge_jz,
+                };
+            },
+            .load_local => if (next == .load_local) {
+                ops[i].code = .load_local2;
+            },
+            else => {},
+        }
+    }
+}
+
+fn localExtent(prog: *Prog) usize {
+    if (prog.local_extent != 0) return prog.local_extent;
+    var extent: usize = 1;
+    for (prog.ops) |op| {
+        const u: u64 = @bitCast(op.arg);
+        const slot: usize = switch (op.code) {
+            .load_local, .load_local2, .store_local, .inc_local, .dec_local => @intCast(u & 0xFFFF_FFFF),
+            .loop_step, .add_local => @max(u & 0xFFFF, (u >> 16) & 0xFFFF),
+            else => continue,
+        };
+        extent = @max(extent, slot + 1);
+    }
+    prog.local_extent = extent;
+    return extent;
+}
 
 pub const EvalError = error{
     StackOverflow,
@@ -42,6 +135,9 @@ pub const Prog = struct {
     state_slots: []Value,
     state_inits: []Value,
     allocator: std.mem.Allocator,
+    // Largest frame-relative local slot any op can touch, plus one; 0 = not
+    // computed yet (see localExtent).
+    local_extent: usize = 0,
 
     pub fn deinit(self: *Prog) void {
         self.allocator.free(self.ops);
@@ -109,15 +205,7 @@ fn appendNumber(scratch: []u8, pos: *usize, num: f64) !void {
     }
 }
 
-extern fn o5s_vm_exec_x86_64(
-    prog: *Prog,
-    entry_ip: usize,
-    host_vars: ?[*]const f64,
-    host_count: usize,
-    out_res: *O5Result,
-) callconv(.{ .x86_64_sysv = .{} }) i32;
-
-threadlocal var asm_scratch_pos: usize = 0;
+threadlocal var scratch_ring_pos: usize = 0;
 
 // ---- std.dbg / std.fmt / std.rng: fixed-size, stack-friendly state ----
 // No heap, no allocator. All buffers are statically bounded:
@@ -378,55 +466,14 @@ pub fn fmtInto(out: []u8, fmt: []const u8, args: []const Value) EvalError!usize 
     return pos;
 }
 
-export fn o5s_asm_str_add(l: *Value, r: *Value) callconv(.{ .x86_64_sysv = .{} }) void {
-    const scratch = &thread_scratch;
-    if (asm_scratch_pos + 1024 > scratch.len) {
-        asm_scratch_pos = 0;
-    }
-    const start_pos = asm_scratch_pos;
-    if (l.val_type == .str) {
-        appendString(scratch, &asm_scratch_pos, l.toSlice()) catch return;
-    } else {
-        appendNumber(scratch, &asm_scratch_pos, l.num) catch return;
-    }
-    if (r.val_type == .str) {
-        appendString(scratch, &asm_scratch_pos, r.toSlice()) catch return;
-    } else {
-        appendNumber(scratch, &asm_scratch_pos, r.num) catch return;
-    }
-    const len = asm_scratch_pos - start_pos;
-    if (len <= types.max_str_len) {
-        l.* = Value.fromStr(scratch[start_pos .. start_pos + len]);
-    }
-}
-
-export fn o5s_asm_str_eq(l: *Value, r: *Value) callconv(.{ .x86_64_sysv = .{} }) u32 {
-    if (l.val_type == .str and r.val_type == .str) {
-        return if (std.mem.eql(u8, l.toSlice(), r.toSlice())) 1 else 0;
-    }
-    return 0;
-}
-
-export fn o5s_asm_str_copy(v: *Value) callconv(.{ .x86_64_sysv = .{} }) void {
-    if (v.val_type != .str or v.str_ptr == null or v.str_len == 0) return;
-    const scratch = &thread_scratch;
-    if (asm_scratch_pos + v.str_len > scratch.len) {
-        asm_scratch_pos = 0;
-    }
-    const start_pos = asm_scratch_pos;
-    @memcpy(scratch[start_pos .. start_pos + v.str_len], v.toSlice());
-    asm_scratch_pos += v.str_len;
-    v.* = Value.fromStr(scratch[start_pos .. start_pos + v.str_len]);
-}
-
 /// Shared Fmt.f implementation: args[0] is the format string.
 /// Result borrows the thread scratch ring (same lifetime rules as `+`).
 fn builtinFmt(args: []const Value) EvalError!Value {
     const scratch = &thread_scratch;
-    if (asm_scratch_pos + types.max_str_len > scratch.len) {
-        asm_scratch_pos = 0;
+    if (scratch_ring_pos + types.max_str_len > scratch.len) {
+        scratch_ring_pos = 0;
     }
-    const start_pos = asm_scratch_pos;
+    const start_pos = scratch_ring_pos;
     const out = scratch[start_pos .. start_pos + types.max_str_len];
     var num_buf: [64]u8 = undefined;
     const fmt_slice: []const u8 = if (args[0].val_type == .str)
@@ -437,165 +484,8 @@ fn builtinFmt(args: []const Value) EvalError!Value {
         break :blk num_buf[0..pos];
     };
     const len = try fmtInto(out, fmt_slice, args[1..]);
-    asm_scratch_pos += types.max_str_len;
+    scratch_ring_pos += types.max_str_len;
     return Value.fromStr(scratch[start_pos .. start_pos + len]);
-}
-
-/// Result protocol for o5s_asm_builtin_call: err == 0 on success with a
-/// SIGNED stack delta (positive pushes, e.g. +24 for arity-0 producers);
-/// err < 0 carries the negated VM error code (-7 StringTooLong, -8 InputEmpty).
-pub const AsmBuiltinRes = extern struct {
-    delta: i64,
-    err: i64,
-};
-
-export fn o5s_asm_builtin_call(packed_arg: i64, stack_top: [*]Value) callconv(.{ .x86_64_sysv = .{} }) AsmBuiltinRes {
-    const ok = struct {
-        fn r(delta: i64) AsmBuiltinRes {
-            return .{ .delta = delta, .err = 0 };
-        }
-    }.r;
-    const fail = struct {
-        fn e(code: i64) AsmBuiltinRes {
-            return .{ .delta = 0, .err = code };
-        }
-    }.e;
-    const builtin_id: Builtin = @enumFromInt(@as(u8, @truncate(@as(u64, @bitCast(packed_arg)))));
-    const arity: u8 = @truncate(@as(u64, @bitCast(packed_arg)) >> 8);
-    // fmt is variadic (format string + up to 7 args): dispatch before arity.
-    if (builtin_id == .fmt) {
-        const n: usize = @max(arity, 1);
-        const args = (stack_top - n)[0..n];
-        const res = builtinFmt(args) catch return fail(-7);
-        (stack_top - n)[0] = res;
-        return ok(-@as(i64, @intCast((n - 1) * 24)));
-    }
-    // Dbg.asr(cond[, msg]): trap AssertionFailed (-9) with a buffer note.
-    if (builtin_id == .dbg_asr) {
-        if (arity < 1 or arity > 2) return fail(-5);
-        const cond = (stack_top - arity)[0];
-        if (!cond.isTruthy()) {
-            const msg: ?Value = if (arity == 2) (stack_top - 1)[0] else null;
-            asrNote(msg);
-            return fail(-9);
-        }
-        (stack_top - arity)[0] = Value.fromNum(0.0);
-        const n: usize = arity;
-        return ok(-@as(i64, @intCast((n - 1) * 24)));
-    }
-    if (arity == 0) {
-        switch (builtin_id) {
-            .dbg_in => {
-                stack_top[0] = dbgInTake() catch return fail(-8);
-                return ok(24);
-            },
-            .rng_next => {
-                stack_top[0] = Value.fromNum(rngUnit());
-                return ok(24);
-            },
-            else => {
-                stack_top[0] = Value.fromNum(0.0);
-                return ok(24);
-            },
-        }
-    }
-    if (arity == 1) {
-        const ptr = stack_top - 1;
-        const arg0 = ptr[0].num;
-        switch (builtin_id) {
-            .dbg_out => {
-                dbgOut(ptr[0]) catch return fail(-7);
-                ptr[0] = Value.fromNum(0.0);
-                return ok(0);
-            },
-            .rng_seed => {
-                rngSeed(@as(u64, @bitCast(arg0)));
-                ptr[0] = Value.fromNum(0.0);
-                return ok(0);
-            },
-            .str_len => {
-                ptr[0] = Value.fromNum(strLen(ptr[0]) catch return fail(-5));
-                return ok(0);
-            },
-            .str_num => {
-                ptr[0] = Value.fromNum(strNum(ptr[0]) catch return fail(-5));
-                return ok(0);
-            },
-            .hsh_fnv => {
-                ptr[0] = Value.fromNum(hshFnv(ptr[0]) catch return fail(-5));
-                return ok(0);
-            },
-            .nos_per => {
-                ptr[0] = Value.fromNum(nosPer(arg0));
-                return ok(0);
-            },
-            else => {
-                const res = switch (builtin_id) {
-                    .sin => @sin(arg0),
-                    .cos => @cos(arg0),
-                    .tan => @tan(arg0),
-                    .asin => math.asin(arg0),
-                    .acos => math.acos(arg0),
-                    .atan => math.atan(arg0),
-                    .sqrt => @sqrt(arg0),
-                    .abs => @abs(arg0),
-                    .floor => @floor(arg0),
-                    .ceil => @ceil(arg0),
-                    .round => @round(arg0),
-                    .log => @log(arg0),
-                    .exp => @exp(arg0),
-                    else => arg0,
-                };
-                ptr[0] = Value.fromNum(res);
-                return ok(0);
-            },
-        }
-    } else if (arity == 2) {
-        const ptr1 = stack_top - 1;
-        const ptr0 = stack_top - 2;
-        const arg1 = ptr1[0].num;
-        const arg0 = ptr0[0].num;
-        if (builtin_id == .str_find) {
-            ptr0[0] = Value.fromNum(strFind(ptr0[0], ptr1[0]) catch return fail(-5));
-            return ok(-24);
-        }
-        if (builtin_id == .nos_per2) {
-            ptr0[0] = Value.fromNum(nosPer2(arg0, arg1));
-            return ok(-24);
-        }
-        const res = switch (builtin_id) {
-            .atan2 => math.atan2(arg0, arg1),
-            .min => @min(arg0, arg1),
-            .max => @max(arg0, arg1),
-            .pow => math.pow(f64, arg0, arg1),
-            .rng_range => arg0 + (arg1 - arg0) * rngUnit(),
-            else => 0.0,
-        };
-        ptr0[0] = Value.fromNum(res);
-        return ok(-24);
-    } else if (arity == 3) {
-        const ptr2 = stack_top - 1;
-        const ptr1 = stack_top - 2;
-        const ptr0 = stack_top - 3;
-        const arg2 = ptr2[0].num;
-        const arg1 = ptr1[0].num;
-        const arg0 = ptr0[0].num;
-        if (builtin_id == .str_sub) {
-            ptr0[0] = strSub(ptr0[0], arg1, arg2) catch |err| return fail(switch (err) {
-                error.OutOfBounds => -6,
-                else => -5,
-            });
-            return ok(-48);
-        }
-        const res = switch (builtin_id) {
-            .clamp => math.clamp(arg0, arg1, arg2),
-            .lerp => math.lerp(arg0, arg1, arg2),
-            else => 0.0,
-        };
-        ptr0[0] = Value.fromNum(res);
-        return ok(-48);
-    }
-    return ok(0);
 }
 
 pub fn run(
@@ -603,44 +493,39 @@ pub fn run(
     entry_ip: usize,
     host_vars: []const f64,
 ) EvalError!Value {
-    if (@import("builtin").cpu.arch == .x86_64 and @import("builtin").os.tag == .linux) {
-        var res: O5Result = .{};
-        const vars_ptr = if (host_vars.len > 0) host_vars.ptr else null;
-        const ret_code = o5s_vm_exec_x86_64(prog, entry_ip, vars_ptr, host_vars.len, &res);
-        if (ret_code == 0) {
-            return Value{
-                .num = res.num,
-                .str_ptr = res.str_ptr,
-                .str_len = res.str_len,
-                .val_type = @enumFromInt(res.val_type),
-            };
-        } else if (ret_code == -6) {
-            return EvalError.OutOfBounds;
-        } else if (ret_code == -2) {
-            return EvalError.StackOverflow;
-        } else if (ret_code == -3) {
-            return EvalError.StackUnderflow;
-        } else if (ret_code == -4) {
-            return EvalError.StepLimitExceeded;
-        } else if (ret_code == -7) {
-            return EvalError.StringTooLong;
-        } else if (ret_code == -8) {
-            return EvalError.InputEmpty;
-        } else if (ret_code == -9) {
-            return EvalError.AssertionFailed;
-        }
-        // Never fall through: re-executing in the interpreter would
-        // double all side effects (dbg buffer, rng state, sta slots).
-        return EvalError.InvalidOpcode;
-    }
+    // Jumps, tables and calls are verified in range at compile time, so a
+    // program ending in halt/ret/jmp can never run off the end: skip the
+    // per-op bounds check for it.
+    const sealed = prog.ops.len > 0 and switch (prog.ops[prog.ops.len - 1].code) {
+        .halt, .ret, .jmp => true,
+        else => false,
+    };
+    return if (sealed and entry_ip < prog.ops.len)
+        exec(false, prog, entry_ip, host_vars)
+    else
+        exec(true, prog, entry_ip, host_vars);
+}
 
+fn exec(
+    comptime checked: bool,
+    prog: *Prog,
+    entry_ip: usize,
+    host_vars: []const f64,
+) EvalError!Value {
     const scratch = &thread_scratch;
     var scratch_pos: usize = 0;
 
     var stack: [max_stack]Value = undefined;
     var sp: usize = 0;
 
-    var locals: [max_locals]Value = std.mem.zeroes([max_locals]Value);
+    const locals = &thread_locals;
+    const static_extent = localExtent(prog);
+    var max_fp: usize = 0;
+    var elem_high: usize = 0;
+    defer {
+        const dirty = @min(max_locals, @max(max_fp + static_extent, elem_high));
+        @memset(locals[0..dirty], std.mem.zeroes(Value));
+    }
     const CallFrame = struct {
         ret_ip: usize,
         prev_fp: usize,
@@ -654,32 +539,57 @@ pub fn run(
     const ops_len = ops.len;
     var steps: usize = 0;
 
-    while (ip < ops_len) {
-        steps += 1;
-        if (steps > max_steps) return EvalError.StepLimitExceeded;
-
-        const op = ops[ip];
+    // Threaded dispatch: each handler fetches and jumps to the next opcode
+    // itself (labeled switch continue), so every op gets its own indirect
+    // branch. Steps are still counted per executed op.
+    if (ip < ops_len) {
+        steps = 1;
+        var op = ops[ip];
         ip += 1;
-
-        switch (op.code) {
-            .nop => {},
+        dispatch: switch (op.code) {
+            .nop => {
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
 
             .push_num => {
                 if (sp >= max_stack) return EvalError.StackOverflow;
                 stack[sp] = Value.fromNum(@bitCast(op.arg));
                 sp += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .push_0 => {
                 if (sp >= max_stack) return EvalError.StackOverflow;
                 stack[sp] = Value.fromNum(0.0);
                 sp += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .push_1 => {
                 if (sp >= max_stack) return EvalError.StackOverflow;
                 stack[sp] = Value.fromNum(1.0);
                 sp += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .push_str => {
@@ -687,10 +597,22 @@ pub fn run(
                 const s = prog.getString(op.arg);
                 stack[sp] = Value.fromStr(s);
                 sp += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .pop => {
                 if (sp > 0) sp -= 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .dup => {
@@ -698,6 +620,12 @@ pub fn run(
                 if (sp >= max_stack) return EvalError.StackOverflow;
                 stack[sp] = stack[sp - 1];
                 sp += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .load_local => {
@@ -705,6 +633,12 @@ pub fn run(
                 const slot: usize = fp + @as(usize, @intCast(op.arg));
                 stack[sp] = if (slot < max_locals) locals[slot] else Value.fromNum(0.0);
                 sp += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .store_local => {
@@ -714,6 +648,12 @@ pub fn run(
                 if (slot < max_locals) {
                     locals[slot] = stack[sp];
                 }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .load_state => {
@@ -721,6 +661,12 @@ pub fn run(
                 const slot: usize = @intCast(op.arg);
                 stack[sp] = if (slot < prog.state_slots.len) prog.state_slots[slot] else Value.fromNum(0.0);
                 sp += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .store_state => {
@@ -730,6 +676,12 @@ pub fn run(
                 if (slot < prog.state_slots.len) {
                     prog.state_slots[slot] = stack[sp];
                 }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .load_host => {
@@ -738,6 +690,12 @@ pub fn run(
                 const val = if (idx < host_vars.len) host_vars[idx] else 0.0;
                 stack[sp] = Value.fromNum(val);
                 sp += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .check_bounds => {
@@ -754,6 +712,12 @@ pub fn run(
                 if (@as(f64, @floatFromInt(idx_int)) != top.num) {
                     return EvalError.OutOfBounds;
                 }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .load_local_elem => {
@@ -766,7 +730,14 @@ pub fn run(
                 if (slot_i64 < 0 or slot_i64 >= max_locals) return EvalError.OutOfBounds;
                 const slot: usize = @intCast(slot_i64);
                 stack[sp] = locals[slot];
+                elem_high = @max(elem_high, slot + 1);
                 sp += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .store_local_elem => {
@@ -780,6 +751,13 @@ pub fn run(
                 if (slot_i64 < 0 or slot_i64 >= max_locals) return EvalError.OutOfBounds;
                 const slot: usize = @intCast(slot_i64);
                 locals[slot] = val;
+                elem_high = @max(elem_high, slot + 1);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .load_state_elem => {
@@ -793,6 +771,12 @@ pub fn run(
                 if (slot >= prog.state_slots.len) return EvalError.OutOfBounds;
                 stack[sp] = prog.state_slots[slot];
                 sp += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .store_state_elem => {
@@ -806,6 +790,12 @@ pub fn run(
                 const slot = base + idx;
                 if (slot >= prog.state_slots.len) return EvalError.OutOfBounds;
                 prog.state_slots[slot] = val;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .add => {
@@ -815,25 +805,16 @@ pub fn run(
                 sp -= 1;
 
                 if (l.val_type == .str or r.val_type == .str) {
-                    const start_pos = scratch_pos;
-                    if (l.val_type == .str) {
-                        try appendString(scratch, &scratch_pos, l.toSlice());
-                    } else {
-                        try appendNumber(scratch, &scratch_pos, l.num);
-                    }
-
-                    if (r.val_type == .str) {
-                        try appendString(scratch, &scratch_pos, r.toSlice());
-                    } else {
-                        try appendNumber(scratch, &scratch_pos, r.num);
-                    }
-
-                    const len = scratch_pos - start_pos;
-                    if (len > types.max_str_len) return EvalError.StringTooLong;
-                    stack[sp - 1] = Value.fromStr(scratch[start_pos .. start_pos + len]);
+                    stack[sp - 1] = try concat(scratch, &scratch_pos, l, r);
                 } else {
                     stack[sp - 1] = Value.fromNum(l.num + r.num);
                 }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .sub => {
@@ -842,6 +823,12 @@ pub fn run(
                 const l = stack[sp - 2];
                 sp -= 1;
                 stack[sp - 1] = Value.fromNum(l.num - r.num);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .mul => {
@@ -850,6 +837,12 @@ pub fn run(
                 const l = stack[sp - 2];
                 sp -= 1;
                 stack[sp - 1] = Value.fromNum(l.num * r.num);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .div => {
@@ -858,6 +851,12 @@ pub fn run(
                 const l = stack[sp - 2];
                 sp -= 1;
                 stack[sp - 1] = Value.fromNum(l.num / r.num);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .mod => {
@@ -870,12 +869,24 @@ pub fn run(
                 } else {
                     stack[sp - 1] = Value.fromNum(@rem(l.num, r.num));
                 }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .neg => {
                 if (sp < 1) return EvalError.StackUnderflow;
                 const top = stack[sp - 1];
                 stack[sp - 1] = Value.fromNum(-top.num);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .bit_and => {
@@ -886,6 +897,12 @@ pub fn run(
                 const a: i64 = f64ToI64Sat(l.num);
                 const b: i64 = f64ToI64Sat(r.num);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(a & b));
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .bit_or => {
@@ -896,6 +913,12 @@ pub fn run(
                 const a: i64 = f64ToI64Sat(l.num);
                 const b: i64 = f64ToI64Sat(r.num);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(a | b));
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .bit_xor => {
@@ -906,6 +929,12 @@ pub fn run(
                 const a: i64 = f64ToI64Sat(l.num);
                 const b: i64 = f64ToI64Sat(r.num);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(a ^ b));
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .bit_not => {
@@ -913,6 +942,12 @@ pub fn run(
                 const top = stack[sp - 1];
                 const a: i64 = f64ToI64Sat(top.num);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(~a));
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .shl => {
@@ -923,6 +958,12 @@ pub fn run(
                 const a: i64 = f64ToI64Sat(l.num);
                 const shift: u6 = @truncate(@as(u64, @bitCast(f64ToI64Sat(r.num))) & 63);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(a << shift));
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .shr => {
@@ -933,6 +974,12 @@ pub fn run(
                 const a: i64 = f64ToI64Sat(l.num);
                 const shift: u6 = @truncate(@as(u64, @bitCast(f64ToI64Sat(r.num))) & 63);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(a >> shift));
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .eq => {
@@ -947,6 +994,12 @@ pub fn run(
                     res = l.num == r.num;
                 }
                 stack[sp - 1] = Value.fromNum(if (res) 1.0 else 0.0);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .ne => {
@@ -963,6 +1016,12 @@ pub fn run(
                     res = true;
                 }
                 stack[sp - 1] = Value.fromNum(if (res) 1.0 else 0.0);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .lt => {
@@ -971,6 +1030,12 @@ pub fn run(
                 const l = stack[sp - 2];
                 sp -= 1;
                 stack[sp - 1] = Value.fromNum(if (l.num < r.num) 1.0 else 0.0);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .le => {
@@ -979,6 +1044,12 @@ pub fn run(
                 const l = stack[sp - 2];
                 sp -= 1;
                 stack[sp - 1] = Value.fromNum(if (l.num <= r.num) 1.0 else 0.0);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .gt => {
@@ -987,6 +1058,12 @@ pub fn run(
                 const l = stack[sp - 2];
                 sp -= 1;
                 stack[sp - 1] = Value.fromNum(if (l.num > r.num) 1.0 else 0.0);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .ge => {
@@ -995,16 +1072,34 @@ pub fn run(
                 const l = stack[sp - 2];
                 sp -= 1;
                 stack[sp - 1] = Value.fromNum(if (l.num >= r.num) 1.0 else 0.0);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .lnot => {
                 if (sp < 1) return EvalError.StackUnderflow;
                 const top = stack[sp - 1];
                 stack[sp - 1] = Value.fromNum(if (!top.isTruthy()) 1.0 else 0.0);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .jmp => {
                 ip = @intCast(op.arg);
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .jmp_if_zero => {
@@ -1013,6 +1108,12 @@ pub fn run(
                 if (!stack[sp].isTruthy()) {
                     ip = @intCast(op.arg);
                 }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .jmp_if_nonzero => {
@@ -1021,6 +1122,12 @@ pub fn run(
                 if (stack[sp].isTruthy()) {
                     ip = @intCast(op.arg);
                 }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .call_builtin => {
@@ -1123,6 +1230,12 @@ pub fn run(
                         stack[sp - 1] = Value.fromNum(res);
                     }
                 }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .call => {
@@ -1133,7 +1246,14 @@ pub fn run(
                 call_stack[csp] = .{ .ret_ip = ip, .prev_fp = fp };
                 csp += 1;
                 fp += frame_shift;
+                max_fp = @max(max_fp, fp);
                 ip = target_ip;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .ret => {
@@ -1142,8 +1262,14 @@ pub fn run(
                     ip = call_stack[csp].ret_ip;
                     fp = call_stack[csp].prev_fp;
                 } else {
-                    break;
+                    break :dispatch;
                 }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .loop_step => {
@@ -1157,6 +1283,12 @@ pub fn run(
                 if (new_val < locals[fp + limit_slot].num) {
                     ip = target_ip;
                 }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .add_local => {
@@ -1164,14 +1296,32 @@ pub fn run(
                 const dest_slot: usize = @intCast(@as(u16, @truncate(packed_u)));
                 const src_slot: usize = @intCast(@as(u16, @truncate(packed_u >> 16)));
                 locals[fp + dest_slot].num += locals[fp + src_slot].num;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
             .inc_local => {
                 const dest_slot: usize = @intCast(op.arg);
                 locals[fp + dest_slot].num += 1.0;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
             .dec_local => {
                 const dest_slot: usize = @intCast(op.arg);
                 locals[fp + dest_slot].num -= 1.0;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
             },
 
             .table_jmp => {
@@ -1182,7 +1332,7 @@ pub fn run(
                 const min_val: i32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(op.arg)))));
                 const count: u32 = @truncate(@as(u64, @bitCast(op.arg)) >> 32);
                 const val_f = val_v.num;
-                // Mirror the asm path (cvttsd2si saturates to INT64_MIN):
+                // cvttsd2si-style saturation (NaN/out-of-range -> INT64_MIN):
                 // non-representable values fall through to the default arm.
                 const val_i: i64 = if (math.isNan(val_f) or val_f >= 9223372036854775808.0 or val_f <= -9223372036854775808.0)
                     std.math.minInt(i64)
@@ -1190,16 +1340,286 @@ pub fn run(
                     @intFromFloat(val_f);
                 if (val_f == @as(f64, @floatFromInt(val_i)) and val_i >= min_val and val_i < @as(i64, min_val) + @as(i64, count)) {
                     const idx: usize = @intCast(val_i - min_val);
-                    ip = @intCast(ops[ip + 1 + idx].arg);
-                    continue;
+                    ip = @intCast(ops[ip + idx].arg);
+                    if (checked and ip >= ops_len) break :dispatch;
+                    steps += 1;
+                    if (steps > max_steps) return EvalError.StepLimitExceeded;
+                    op = ops[ip];
+                    ip += 1;
+                    continue :dispatch op.code;
                 } else {
-                    ip = @intCast(ops[ip + 1 + count].arg);
-                    continue;
+                    ip = @intCast(ops[ip + count].arg);
+                    if (checked and ip >= ops_len) break :dispatch;
+                    steps += 1;
+                    if (steps > max_steps) return EvalError.StepLimitExceeded;
+                    op = ops[ip];
+                    ip += 1;
+                    continue :dispatch op.code;
                 }
             },
 
+            .add_k => {
+                if (sp >= max_stack) return EvalError.StackOverflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (sp < 1) return EvalError.StackUnderflow;
+                const k: f64 = @bitCast(op.arg);
+                const l = stack[sp - 1];
+                stack[sp - 1] = if (l.val_type == .str) try concat(scratch, &scratch_pos, l, Value.fromNum(k)) else Value.fromNum(l.num + k);
+                ip += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .sub_k => {
+                if (sp >= max_stack) return EvalError.StackOverflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (sp < 1) return EvalError.StackUnderflow;
+                const k: f64 = @bitCast(op.arg);
+                const l = stack[sp - 1];
+                stack[sp - 1] = Value.fromNum(l.num - k);
+                ip += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .mul_k => {
+                if (sp >= max_stack) return EvalError.StackOverflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (sp < 1) return EvalError.StackUnderflow;
+                const k: f64 = @bitCast(op.arg);
+                const l = stack[sp - 1];
+                stack[sp - 1] = Value.fromNum(l.num * k);
+                ip += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .div_k => {
+                if (sp >= max_stack) return EvalError.StackOverflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (sp < 1) return EvalError.StackUnderflow;
+                const k: f64 = @bitCast(op.arg);
+                const l = stack[sp - 1];
+                stack[sp - 1] = Value.fromNum(l.num / k);
+                ip += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .lt_jz => {
+                if (sp < 2) return EvalError.StackUnderflow;
+                const r = stack[sp - 1];
+                const l = stack[sp - 2];
+                sp -= 2;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (l.num < r.num) {
+                    ip += 1;
+                } else {
+                    ip = @intCast(ops[ip].arg);
+                }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .lt_k_jz => {
+                if (sp >= max_stack) return EvalError.StackOverflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (sp < 1) return EvalError.StackUnderflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                const k: f64 = @bitCast(op.arg);
+                const l = stack[sp - 1];
+                sp -= 1;
+                if (l.num < k) {
+                    ip += 2;
+                } else {
+                    ip = @intCast(ops[ip + 1].arg);
+                }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .le_jz => {
+                if (sp < 2) return EvalError.StackUnderflow;
+                const r = stack[sp - 1];
+                const l = stack[sp - 2];
+                sp -= 2;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (l.num <= r.num) {
+                    ip += 1;
+                } else {
+                    ip = @intCast(ops[ip].arg);
+                }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .le_k_jz => {
+                if (sp >= max_stack) return EvalError.StackOverflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (sp < 1) return EvalError.StackUnderflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                const k: f64 = @bitCast(op.arg);
+                const l = stack[sp - 1];
+                sp -= 1;
+                if (l.num <= k) {
+                    ip += 2;
+                } else {
+                    ip = @intCast(ops[ip + 1].arg);
+                }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .gt_jz => {
+                if (sp < 2) return EvalError.StackUnderflow;
+                const r = stack[sp - 1];
+                const l = stack[sp - 2];
+                sp -= 2;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (l.num > r.num) {
+                    ip += 1;
+                } else {
+                    ip = @intCast(ops[ip].arg);
+                }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .gt_k_jz => {
+                if (sp >= max_stack) return EvalError.StackOverflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (sp < 1) return EvalError.StackUnderflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                const k: f64 = @bitCast(op.arg);
+                const l = stack[sp - 1];
+                sp -= 1;
+                if (l.num > k) {
+                    ip += 2;
+                } else {
+                    ip = @intCast(ops[ip + 1].arg);
+                }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .ge_jz => {
+                if (sp < 2) return EvalError.StackUnderflow;
+                const r = stack[sp - 1];
+                const l = stack[sp - 2];
+                sp -= 2;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (l.num >= r.num) {
+                    ip += 1;
+                } else {
+                    ip = @intCast(ops[ip].arg);
+                }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .ge_k_jz => {
+                if (sp >= max_stack) return EvalError.StackOverflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (sp < 1) return EvalError.StackUnderflow;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                const k: f64 = @bitCast(op.arg);
+                const l = stack[sp - 1];
+                sp -= 1;
+                if (l.num >= k) {
+                    ip += 2;
+                } else {
+                    ip = @intCast(ops[ip + 1].arg);
+                }
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
+            .load_local2 => {
+                if (sp >= max_stack) return EvalError.StackOverflow;
+                const a: usize = fp + @as(usize, @intCast(op.arg));
+                stack[sp] = if (a < max_locals) locals[a] else Value.fromNum(0.0);
+                sp += 1;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                if (sp >= max_stack) return EvalError.StackOverflow;
+                const b: usize = fp + @as(usize, @intCast(ops[ip].arg));
+                stack[sp] = if (b < max_locals) locals[b] else Value.fromNum(0.0);
+                sp += 1;
+                ip += 1;
+                if (checked and ip >= ops_len) break :dispatch;
+                steps += 1;
+                if (steps > max_steps) return EvalError.StepLimitExceeded;
+                op = ops[ip];
+                ip += 1;
+                continue :dispatch op.code;
+            },
+
             .halt => {
-                break;
+                break :dispatch;
             },
         }
     }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 using O5Script.Common;
 using O5Script.Native;
@@ -11,6 +12,15 @@ public sealed class O5ScriptProgram : IDisposable {
     private readonly string[] _hostTags;
     private readonly string[] _tags;
     private readonly Dictionary<string, int> _tagLookup;
+    // Last result per entry point (tags, then the main program). HUD scripts
+    // mostly return the same value every frame, so reuse its decoded text.
+    private readonly ResultMemo?[] _memos;
+
+    private sealed class ResultMemo(byte[]? bytes, long numBits, string text) {
+        public readonly byte[]? Bytes = bytes;
+        public readonly long NumBits = numBits;
+        public readonly string Text = text;
+    }
 
     public IReadOnlyList<string> HostTags => _hostTags;
     public IReadOnlyList<string> Tags => _tags;
@@ -40,7 +50,35 @@ public sealed class O5ScriptProgram : IDisposable {
                 _tagLookup[name] = (int)i;
             }
         }
+        _memos = new ResultMemo?[tagCount + 1];
     }
+
+    private int MainSlot => _tags.Length;
+
+    private static unsafe bool IsString(in O5NativeResult res) =>
+        res.ValType == (byte)O5Type.Str && res.StrPtr != null && res.StrLen > 0;
+
+    private unsafe string StringOf(int slot, in O5NativeResult res) {
+        var bytes = new ReadOnlySpan<byte>(res.StrPtr, (int)res.StrLen);
+        var memo = _memos[slot];
+        if (memo?.Bytes != null && bytes.SequenceEqual(memo.Bytes)) return memo.Text;
+        string text = Encoding.UTF8.GetString(res.StrPtr, (int)res.StrLen);
+        _memos[slot] = new ResultMemo(bytes.ToArray(), 0, text);
+        return text;
+    }
+
+    private string TextOf(int slot, in O5NativeResult res) {
+        if (IsString(res)) return StringOf(slot, res);
+        long bits = BitConverter.DoubleToInt64Bits(res.Num);
+        var memo = _memos[slot];
+        if (memo != null && memo.Bytes == null && memo.NumBits == bits) return memo.Text;
+        string text = res.Num.ToString(CultureInfo.InvariantCulture);
+        _memos[slot] = new ResultMemo(null, bits, text);
+        return text;
+    }
+
+    private O5Value ValueOf(int slot, in O5NativeResult res) =>
+        IsString(res) ? O5Value.FromStr(StringOf(slot, res)) : O5Value.FromNum(res.Num);
 
     public unsafe double ExecuteNum(ReadOnlySpan<double> hostVars = default) {
         if (_handle == 0) return double.NaN;
@@ -56,7 +94,7 @@ public sealed class O5ScriptProgram : IDisposable {
         fixed (double* p = hostVars) {
             int rc = NativeO5Script.o5s_run(_handle, p, (nuint)hostVars.Length, out var res);
             if (rc < 0) return string.Empty;
-            return res.ToValue().ToString();
+            return TextOf(MainSlot, res);
         }
     }
 
@@ -65,7 +103,7 @@ public sealed class O5ScriptProgram : IDisposable {
         fixed (double* p = hostVars) {
             int rc = NativeO5Script.o5s_run(_handle, p, (nuint)hostVars.Length, out var res);
             if (rc < 0) return O5Value.Zero;
-            return res.ToValue();
+            return ValueOf(MainSlot, res);
         }
     }
 
@@ -90,7 +128,7 @@ public sealed class O5ScriptProgram : IDisposable {
         fixed (double* p = hostVars) {
             int rc = NativeO5Script.o5s_run_tag(_handle, (nuint)idx, p, (nuint)hostVars.Length, out var res);
             if (rc < 0) return string.Empty;
-            return res.ToValue().ToString();
+            return TextOf(idx, res);
         }
     }
 
@@ -99,7 +137,7 @@ public sealed class O5ScriptProgram : IDisposable {
         fixed (double* p = hostVars) {
             int rc = NativeO5Script.o5s_run_tag(_handle, (nuint)idx, p, (nuint)hostVars.Length, out var res);
             if (rc < 0) return O5Value.Zero;
-            return res.ToValue();
+            return ValueOf(idx, res);
         }
     }
 
