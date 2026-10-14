@@ -167,12 +167,12 @@ test "bitwise and shift operators" {
     try std.testing.expectEqual(@as(f64, 31.0), res.num);
 }
 
-test "math builtins through module imports" {
+test "mat builtins through module imports" {
     const allocator = std.testing.allocator;
     const src =
         \\con Std = @("std");
-        \\con Math = Std.Math;
-        \\Math.pow(2, 4) + Math.clamp(15, 0, 10) + Math.lerp(0, 100, 0.5)
+        \\con Mat = Std.Mat;
+        \\Mat.pow(2, 4) + Mat.clamp(15, 0, 10) + Mat.lerp(0, 100, 0.5)
     ;
     const prog = try compiler.compileSource(src, allocator);
     defer prog.deinit();
@@ -185,8 +185,8 @@ test "math builtins through module imports" {
 test "direct submodule import and constants" {
     const allocator = std.testing.allocator;
     const src =
-        \\con Math = @("std.math");
-        \\Math.sin(0) + Math.pi
+        \\con Mat = @("std.mat");
+        \\Mat.sin(0) + Mat.pi
     ;
     const prog = try compiler.compileSource(src, allocator);
     defer prog.deinit();
@@ -1702,6 +1702,139 @@ test "ub bad array dimension" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.DimensionMismatch, compiler.compileSource(
         \\let a: [100000000000000000000]num = [1];
+    , allocator));
+}
+
+test "std declaration stubs compile" {
+    const allocator = std.testing.allocator;
+    // Stubs live in <repo>/std/ (mirrors the @("std.x") namespace).
+    // Tests run with native/ as CWD via `zig build test`; read via libc
+    // like main.zig (std.fs was reworked in 0.17).
+    const stubs = [_][]const u8{
+        "../std/mat.o5s",
+        "../std/dbg.o5s",
+        "../std/fmt.o5s",
+        "../std/rng.o5s",
+        "../std/str.o5s",
+        "../std/hsh.o5s",
+        "../std/nos.o5s",
+        "../std/std.o5s",
+    };
+    for (stubs) |relpath| {
+        var path_buf: [1024]u8 = undefined;
+        if (relpath.len >= path_buf.len) return error.OutOfMemory;
+        @memcpy(path_buf[0..relpath.len], relpath);
+        path_buf[relpath.len] = 0;
+        const fd = open(path_buf[0..relpath.len :0], 0, 0);
+        if (fd < 0) return error.FileNotFound;
+        defer _ = close(fd);
+        const buf = try allocator.alloc(u8, 65536);
+        defer allocator.free(buf);
+        const n = read(fd, buf.ptr, buf.len);
+        if (n <= 0) return error.FileNotFound;
+        const prog = try compiler.compileSource(buf[0..@intCast(n)], allocator);
+        prog.deinit();
+    }
+}
+
+extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+extern "c" fn close(fd: c_int) c_int;
+
+test "enm auto explicit negative" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\enm Color {
+        \\    Red,
+        \\    Green = 10,
+        \\    Blue,
+        \\    Dark = -3,
+        \\    Black,
+        \\}
+        \\Color.Red + Color.Green * 100 + Color.Blue * 10000 + Color.Dark * 1000000 + Color.Black * 100000000
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 0 + 1000 + 110000 - 3000000 - 200000000 = -202889000
+    try std.testing.expectEqual(@as(f64, -202889000.0), res.num);
+}
+
+test "enm str values and annotation" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\enm Level {
+        \\    Low = "low",
+        \\    High = "high",
+        \\}
+        \\let l: Level = Level.High;
+        \\l + "|" + Level.Low
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqualStrings("high|low", res.toSlice());
+}
+
+test "enm jmp labels with table" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\enm Op {
+        \\    Add = 1,
+        \\    Sub = 2,
+        \\    Mul = 3,
+        \\}
+        \\fun apply(op: num, a: num, b: num): num {
+        \\    ret jmp op {
+        \\        Op.Add => a + b,
+        \\        Op.Sub | Op.Mul => a - b,
+        \\        _ => 0
+        \\    };
+        \\}
+        \\apply(Op.Add, 10, 4) * 100 + apply(Op.Mul, 10, 4) + apply(9, 10, 4)
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 1400 + 6 + 0 = 1406
+    try std.testing.expectEqual(@as(f64, 1406.0), res.num);
+}
+
+test "enm errors" {
+    const allocator = std.testing.allocator;
+    // mixed num/str
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource(
+        \\enm E { A, B = "b" }
+    , allocator));
+    // fractional value
+    try std.testing.expectError(error.TypeMismatch, compiler.compileSource(
+        \\enm E { A = 1.5 }
+    , allocator));
+    // duplicate member
+    try std.testing.expectError(error.DuplicateVariable, compiler.compileSource(
+        \\enm E { A, A }
+    , allocator));
+    // unknown variant
+    try std.testing.expectError(error.UndefinedVariable, compiler.compileSource(
+        \\enm E { A }
+        \\E.B
+    , allocator));
+    // bare name stays unbound (Zero Pollution)
+    try std.testing.expectError(error.UndefinedVariable, compiler.compileSource(
+        \\enm E { A }
+        \\A
+    , allocator));
+    // struct/enm name collision both ways
+    try std.testing.expectError(error.DuplicateVariable, compiler.compileSource(
+        \\stu Color { x: num }
+        \\enm Color { Red }
+    , allocator));
+    try std.testing.expectError(error.DuplicateVariable, compiler.compileSource(
+        \\enm Color { Red }
+        \\stu Color { x: num }
     , allocator));
 }
 

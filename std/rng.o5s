@@ -1,0 +1,11 @@
+// Declaration stub for @("std.rng").
+// Not executed. Kept in sync with the compiler by test
+// "std declaration stubs compile".
+// Click-through anchor for future editor support:
+// `@("std.rng")` maps to this file.
+
+con Rng = @("std.rng");
+
+fun Rng.next(): num => 0;
+fun Rng.range(lo: num, hi: num): num => 0;
+fun Rng.seed(n: num): num => 0;

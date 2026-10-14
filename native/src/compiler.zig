@@ -82,6 +82,7 @@ pub const TokenType = enum {
     kw_tru,
     kw_fls,
     kw_stu,
+    kw_enm,
     kw_jmp,
     kw_go,
     label,
@@ -258,6 +259,7 @@ pub const Lexer = struct {
                 else if (std.mem.eql(u8, ident, "tru")) TokenType.kw_tru
                 else if (std.mem.eql(u8, ident, "fls")) TokenType.kw_fls
                 else if (std.mem.eql(u8, ident, "stu")) TokenType.kw_stu
+                else if (std.mem.eql(u8, ident, "enm")) TokenType.kw_enm
                 else if (std.mem.eql(u8, ident, "jmp")) TokenType.kw_jmp
                 else if (std.mem.eql(u8, ident, "go")) TokenType.kw_go
                 else TokenType.ident;
@@ -416,6 +418,8 @@ pub const Compiler = struct {
     array_count: usize = 0,
     struct_defs: [16]StructDef = undefined,
     struct_def_count: usize = 0,
+    enum_defs: [16]EnumDef = undefined,
+    enum_def_count: usize = 0,
     struct_vars: [32]StructVar = undefined,
     struct_var_count: usize = 0,
     method_name_buf: [2048]u8 = undefined,
@@ -566,6 +570,36 @@ pub const Compiler = struct {
         link_off: usize = 0,
     };
 
+    pub const EnumVariant = struct {
+        name: []const u8,
+        num_val: f64 = 0.0,
+        str_val: ?[]const u8 = null,
+    };
+
+    pub const EnumDef = struct {
+        name: []const u8,
+        is_str: bool = false,
+        variants: [32]EnumVariant = undefined,
+        variant_count: usize = 0,
+
+        pub fn addVariant(self: *EnumDef, name: []const u8, num_val: f64, str_val: ?[]const u8) CompileError!void {
+            if (self.variant_count >= 32) return error.TooManyLocals;
+            self.variants[self.variant_count] = .{
+                .name = name,
+                .num_val = num_val,
+                .str_val = str_val,
+            };
+            self.variant_count += 1;
+        }
+
+        pub fn findVariant(self: EnumDef, name: []const u8) ?EnumVariant {
+            for (self.variants[0..self.variant_count]) |v| {
+                if (std.mem.eql(u8, v.name, name)) return v;
+            }
+            return null;
+        }
+    };
+
     pub const TypeAnnotation = struct {
         data_type: DataType = .unknown,
         array: ?ArrayInfo = null,
@@ -581,7 +615,7 @@ pub const Compiler = struct {
 
     pub const ModuleKind = enum {
         std,
-        math,
+        mat,
         dbg,
         fmt,
         rng,
@@ -604,6 +638,7 @@ pub const Compiler = struct {
             .module_count = 0,
             .array_count = 0,
             .struct_def_count = 0,
+            .enum_def_count = 0,
             .struct_var_count = 0,
             .local_count = 0,
             .state_count = 0,
@@ -811,6 +846,19 @@ pub const Compiler = struct {
         if (self.struct_def_count >= 16) return error.TooManyLocals;
         self.struct_defs[self.struct_def_count] = def;
         self.struct_def_count += 1;
+    }
+
+    fn findEnumDef(self: *Compiler, name: []const u8) ?EnumDef {
+        for (self.enum_defs[0..self.enum_def_count]) |d| {
+            if (std.mem.eql(u8, d.name, name)) return d;
+        }
+        return null;
+    }
+
+    fn addEnumDef(self: *Compiler, def: EnumDef) CompileError!void {
+        if (self.enum_def_count >= 16) return error.TooManyLocals;
+        self.enum_defs[self.enum_def_count] = def;
+        self.enum_def_count += 1;
     }
 
     fn findStructVar(self: *Compiler, name: []const u8) ?StructVar {
@@ -1420,6 +1468,9 @@ pub const Compiler = struct {
                 dt = .str;
             } else if (self.findStructDef(tname) != null) {
                 sname_annot = tname;
+            } else if (self.findEnumDef(tname)) |edef| {
+                // Enum annotation documents intent; the value is num or str.
+                dt = if (edef.is_str) .str else .num;
             } else if (std.mem.eql(u8, tname, "slf")) {
                 // `slf` return type: resolved to the receiver struct in
                 // parseFuncInternal; rejected everywhere else (UnknownType).
@@ -1600,11 +1651,68 @@ pub const Compiler = struct {
         }
     }
 
+    fn parseEnmDef(self: *Compiler) CompileError!void {
+        _ = self.match(.kw_enm);
+        if (self.cur.tag != .ident) return error.SyntaxError;
+        const ename = self.cur.text;
+        self.advance();
+        if (self.findStructDef(ename) != null) return error.DuplicateVariable;
+        if (!self.match(.l_brace)) return error.SyntaxError;
+
+        var def = EnumDef{ .name = ename };
+        var next_num: f64 = 0;
+        var has_num = false;
+        var has_str = false;
+        while (self.cur.tag != .r_brace and self.cur.tag != .eof) {
+            if (self.cur.tag != .ident) return error.SyntaxError;
+            const vname = self.cur.text;
+            if (def.findVariant(vname) != null) return error.DuplicateVariable;
+            self.advance();
+            if (self.match(.equal)) {
+                if (self.cur.tag == .number) {
+                    const nv = self.cur.num_val;
+                    if (nv != @trunc(nv)) return error.TypeMismatch;
+                    self.advance();
+                    try def.addVariant(vname, nv, null);
+                    next_num = nv + 1;
+                    has_num = true;
+                } else if (self.match(.minus)) {
+                    if (self.cur.tag != .number) return error.SyntaxError;
+                    const nv = -self.cur.num_val;
+                    if (nv != @trunc(nv)) return error.TypeMismatch;
+                    self.advance();
+                    try def.addVariant(vname, nv, null);
+                    next_num = nv + 1;
+                    has_num = true;
+                } else if (self.cur.tag == .string) {
+                    const raw = self.cur.text;
+                    const s = if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') raw[1 .. raw.len - 1] else raw;
+                    if (s.len > types.max_str_len) return error.StringLiteralTooLong;
+                    self.advance();
+                    try def.addVariant(vname, 0, s);
+                    has_str = true;
+                } else return error.SyntaxError;
+            } else {
+                try def.addVariant(vname, next_num, null);
+                next_num += 1;
+                has_num = true;
+            }
+            if (has_num and has_str) return error.TypeMismatch;
+            _ = self.match(.comma);
+            _ = self.match(.semicolon);
+        }
+        if (!self.match(.r_brace)) return error.SyntaxError;
+        _ = self.match(.semicolon);
+        def.is_str = has_str;
+        try self.addEnumDef(def);
+    }
+
     fn parseStructDef(self: *Compiler) CompileError!void {
         _ = self.match(.kw_stu);
         if (self.cur.tag != .ident) return error.SyntaxError;
         const sname = self.cur.text;
         self.advance();
+        if (self.findEnumDef(sname) != null) return error.DuplicateVariable;
         if (!self.match(.l_brace)) return error.SyntaxError;
 
         const def = StructDef{ .name = sname };
@@ -1879,7 +1987,22 @@ pub const Compiler = struct {
             } else {
                 while (true) {
                     var item = PatItem{ .kind = .num };
-                    if (self.cur.tag == .number or (self.cur.tag == .minus and self.peek.tag == .number)) {
+                    if (self.cur.tag == .ident and self.peek.tag == .dot) {
+                        // Enum variant label (`Color.Red`): fold to num/str item.
+                        const ename = self.cur.text;
+                        const edef = self.findEnumDef(ename) orelse return error.SyntaxError;
+                        self.advance();
+                        self.advance();
+                        if (self.cur.tag != .ident) return error.SyntaxError;
+                        const vname = self.cur.text;
+                        self.advance();
+                        const v = edef.findVariant(vname) orelse return error.UndefinedVariable;
+                        if (v.str_val) |s| {
+                            item = .{ .kind = .str, .str_val = s };
+                        } else {
+                            item = .{ .kind = .num, .num_val = v.num_val };
+                        }
+                    } else if (self.cur.tag == .number or (self.cur.tag == .minus and self.peek.tag == .number)) {
                         var n: f64 = 0.0;
                         if (self.match(.minus)) {
                             n = -self.cur.num_val;
@@ -2416,6 +2539,11 @@ pub const Compiler = struct {
             return;
         }
 
+        if (self.match(.kw_enm)) {
+            try self.parseEnmDef();
+            return;
+        }
+
         if (self.match(.kw_let)) {
             const name = self.cur.text;
             self.advance();
@@ -2713,8 +2841,8 @@ pub const Compiler = struct {
                     if (std.ascii.eqlIgnoreCase(path, "std")) {
                         self.addModule(name, .std);
                         return;
-                    } else if (std.ascii.eqlIgnoreCase(path, "std.math")) {
-                        self.addModule(name, .math);
+                    } else if (std.ascii.eqlIgnoreCase(path, "std.mat")) {
+                        self.addModule(name, .mat);
                         return;
                     } else if (std.ascii.eqlIgnoreCase(path, "std.dbg")) {
                         self.addModule(name, .dbg);
@@ -2745,10 +2873,10 @@ pub const Compiler = struct {
                     if (mod == .std and self.peek.tag == .dot) {
                         self.advance();
                         self.advance();
-                        if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "math")) {
+                        if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "mat")) {
                             self.advance();
                             _ = self.match(.semicolon);
-                            self.addModule(name, .math);
+                            self.addModule(name, .mat);
                             return;
                         }
                         if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "dbg")) {
@@ -4035,10 +4163,10 @@ pub const Compiler = struct {
                 if (mod == .std and self.peek.tag == .dot) {
                     self.advance();
                     self.advance();
-                    if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "math") and self.peek.tag == .dot) {
+                    if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "mat") and self.peek.tag == .dot) {
                         self.advance();
                         self.advance();
-                        try self.parseMathMember();
+                        try self.parseMatMember();
                         self.last_expr_type = .num;
                         return;
                     }
@@ -4078,10 +4206,10 @@ pub const Compiler = struct {
                         try self.parseNosMember();
                         return;
                     }
-                } else if (mod == .math and self.peek.tag == .dot) {
+                } else if (mod == .mat and self.peek.tag == .dot) {
                     self.advance();
                     self.advance();
-                    try self.parseMathMember();
+                    try self.parseMatMember();
                     self.last_expr_type = .num;
                     return;
                 } else if (mod == .dbg and self.peek.tag == .dot) {
@@ -4113,6 +4241,34 @@ pub const Compiler = struct {
                     self.advance();
                     self.advance();
                     try self.parseNosMember();
+                    return;
+                }
+            }
+
+            // Enum variant access (`Color.Red`): zero-cost compile-time fold.
+            // Bare names stay unbound (Zero Pollution); no-dot falls through.
+            if (self.findEnumDef(name)) |edef| {
+                if (self.peek.tag == .dot) {
+                    self.advance();
+                    self.advance();
+                    if (self.cur.tag != .ident) return error.SyntaxError;
+                    const vname = self.cur.text;
+                    self.advance();
+                    const v = edef.findVariant(vname) orelse return error.UndefinedVariable;
+                    if (v.str_val) |s| {
+                        const arg = try self.addString(s);
+                        _ = try self.emit(.push_str, arg);
+                        self.last_expr_type = .str;
+                    } else if (v.num_val == 0.0) {
+                        self.last_expr_type = .num;
+                        _ = try self.emit(.push_0, 0);
+                    } else if (v.num_val == 1.0) {
+                        self.last_expr_type = .num;
+                        _ = try self.emit(.push_1, 0);
+                    } else {
+                        self.last_expr_type = .num;
+                        _ = try self.emit(.push_num, @bitCast(v.num_val));
+                    }
                     return;
                 }
             }
@@ -4190,7 +4346,7 @@ pub const Compiler = struct {
         return error.SyntaxError;
     }
 
-    fn parseMathMember(self: *Compiler) CompileError!void {
+    fn parseMatMember(self: *Compiler) CompileError!void {
         if (self.cur.tag != .ident) return error.SyntaxError;
         const member = self.cur.text;
         self.advance();

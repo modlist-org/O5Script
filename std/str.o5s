@@ -1,0 +1,12 @@
+// Declaration stub for @("std.str").
+// Not executed. Kept in sync with the compiler by test
+// "std declaration stubs compile".
+// Click-through anchor for future editor support:
+// `@("std.str")` maps to this file.
+
+con Str = @("std.str");
+
+fun Str.len(s: str): num => 0;
+fun Str.sub(s: str, a: num, b: num): str => "";
+fun Str.find(s: str, sub: str): num => 0;
+fun Str.num(s: str): num => 0;

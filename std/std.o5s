@@ -1,0 +1,9 @@
+// Declaration stub for @("std").
+// Not executed. Two-level imports (`con Mat = Std.Mat;`) resolve here.
+// Click-through anchor for future editor support:
+// `@("std")` maps to this file.
+
+con Std = @("std");
+
+// Submodules (each has its own stub): Std.Mat Std.Dbg Std.Fmt Std.Rng
+// Std.Str Std.Hsh Std.Nos

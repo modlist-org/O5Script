@@ -1,0 +1,12 @@
+// Declaration stub for @("std.fmt").
+// Not executed. Kept in sync with the compiler by test
+// "std declaration stubs compile".
+// Click-through anchor for future editor support:
+// `@("std.fmt")` maps to this file.
+
+con Fmt = @("std.fmt");
+
+// Fmt.f(fmtstr, args...): mini printf, at most 8 total operands
+// (format string + up to 7 args). Placeholders: {} {d} {{ }}.
+// Shown here at max arity.
+fun Fmt.f(f: str, a: num, b: num, c: num, d: num, e: num, g: num, h: num): str => "";

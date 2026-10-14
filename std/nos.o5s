@@ -1,0 +1,10 @@
+// Declaration stub for @("std.nos").
+// Not executed. Kept in sync with the compiler by test
+// "std declaration stubs compile".
+// Click-through anchor for future editor support:
+// `@("std.nos")` maps to this file.
+
+con Nos = @("std.nos");
+
+fun Nos.per(x: num): num => 0;
+fun Nos.per2(x: num, y: num): num => 0;

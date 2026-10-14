@@ -1,0 +1,29 @@
+// Declaration stub for @("std.mat").
+// Not executed. Kept in sync with the compiler by test
+// "std declaration stubs compile".
+// Click-through anchor for future editor support:
+// `@("std.mat")` maps to this file.
+
+con Mat = @("std.mat");
+
+// Constants (compile-time folded): Mat.pi, Mat.e, Mat.tau
+
+fun Mat.sin(x: num): num => 0;
+fun Mat.cos(x: num): num => 0;
+fun Mat.tan(x: num): num => 0;
+fun Mat.asin(x: num): num => 0;
+fun Mat.acos(x: num): num => 0;
+fun Mat.atan(x: num): num => 0;
+fun Mat.atan2(y: num, x: num): num => 0;
+fun Mat.sqrt(x: num): num => 0;
+fun Mat.abs(x: num): num => 0;
+fun Mat.floor(x: num): num => 0;
+fun Mat.ceil(x: num): num => 0;
+fun Mat.round(x: num): num => 0;
+fun Mat.min(a: num, b: num): num => 0;
+fun Mat.max(a: num, b: num): num => 0;
+fun Mat.clamp(v: num, lo: num, hi: num): num => 0;
+fun Mat.lerp(a: num, b: num, t: num): num => 0;
+fun Mat.pow(a: num, b: num): num => 0;
+fun Mat.log(x: num): num => 0;
+fun Mat.exp(x: num): num => 0;

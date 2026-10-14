@@ -169,16 +169,16 @@ CLI testing and general-purpose fun.
 - Import standard library:
   ```o5s
   con Std = @("std");
-  con Math = Std.Math;
+  con Mat = Std.Mat;
   ```
 - Direct submodule import:
   ```o5s
-  con Math = @("std.math");
+  con Mat = @("std.mat");
   ```
 
-### `Std.Math` Functions & Constants
-- Functions: `Math.sin(x)`, `Math.cos(x)`, `Math.tan(x)`, `Math.asin(x)`, `Math.acos(x)`, `Math.atan(x)`, `Math.atan2(y, x)`, `Math.sqrt(x)`, `Math.abs(x)`, `Math.floor(x)`, `Math.ceil(x)`, `Math.round(x)`, `Math.min(a, b)`, `Math.max(a, b)`, `Math.clamp(v, min, max)`, `Math.lerp(a, b, t)`, `Math.pow(a, b)`, `Math.log(x)`, `Math.exp(x)`
-- Constants (compile-time folded): `Math.pi`, `Math.e`, `Math.tau`
+### `Std.Mat` Functions & Constants
+- Functions: `Mat.sin(x)`, `Mat.cos(x)`, `Mat.tan(x)`, `Mat.asin(x)`, `Mat.acos(x)`, `Mat.atan(x)`, `Mat.atan2(y, x)`, `Mat.sqrt(x)`, `Mat.abs(x)`, `Mat.floor(x)`, `Mat.ceil(x)`, `Mat.round(x)`, `Mat.min(a, b)`, `Mat.max(a, b)`, `Mat.clamp(v, min, max)`, `Mat.lerp(a, b, t)`, `Mat.pow(a, b)`, `Mat.log(x)`, `Mat.exp(x)`
+- Constants (compile-time folded): `Mat.pi`, `Mat.e`, `Mat.tau`
 
 ### `Std.Dbg` (Debug I/O, Host-Drained)
 Opt-in debug output/input. The VM never performs I/O itself: `out` appends to a
@@ -251,6 +251,15 @@ Integer-lattice hashed, zero state; coordinates wrap mod 1024.
 ### `Dbg.Asr` (Assert)
 - `Dbg.asr(cond[, msg])`: traps `AssertionFailed` when `cond` is falsy, after
   appending `assert failed[: msg]` to the drain buffer. Returns `0`.
+
+### Declaration Stubs (`std/*.o5s`, IDE Click-Through)
+Each module has a declaration stub under `std/` mirroring its import path
+(`@("std.mat")` → `std/mat.o5s`). Stubs use valid O5S (dummy bodies) and are
+compile-checked by test "std declaration stubs compile", so they cannot drift
+from the compiler. They are the click-through anchor for future editor support
+(a definition provider only needs the `@("std.X")` → `std/X.o5s` mapping).
+One exception: `Dbg.out` is documented in comments only, since `out` is a
+reserved keyword and cannot be a `fun` name.
 
 ---
 
@@ -418,6 +427,35 @@ stu Car {
 let car = Car { engine: Engine { rpm: 1000 } };
 car.accelerate();
 car.engine.rpm // 1500
+```
+
+### Enumerations (`enm`)
+
+`enm` is a compile-time constant set in the spirit of C enums and TypeScript
+`const enum`: every use folds to a `push_num` / `push_str` (zero-cost, zero
+allocation). Members auto-increment from `0` (C semantics); explicit values
+must be integral (`num`) or strings (`str`); mixing both in one `enm` is a
+compile error, as are duplicate member names. Duplicate *values* are allowed
+(aliases). Access is always qualified (`Color.Red`); bare names stay unbound
+(Zero Pollution). An `enm` name cannot collide with a `stu` name.
+
+```o5s
+enm Color {
+    Red,          // 0
+    Green = 10,
+    Blue,         // 11
+}
+
+enm Level {
+    Low = "low",
+    High = "high",
+}
+
+let c: Color = Color.Red;  // annotation documents intent (checked as num)
+jmp c {
+    Color.Red => "red",    // labels fold; dense tables still apply
+    _ => "other"
+}
 ```
 
 ---

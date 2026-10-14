@@ -162,21 +162,21 @@ public class O5ScriptEngineTests {
     }
 
     [Fact]
-    public void MathBuiltins_WorkAccuratelyThroughModules() {
+    public void MatBuiltins_WorkAccuratelyThroughModules() {
         string src = """
         con Std = @("std");
-        con Math = Std.Math;
-        Math.pow(2, 4) + Math.clamp(15, 0, 10) + Math.lerp(0, 100, 0.5)
+        con Mat = Std.Mat;
+        Mat.pow(2, 4) + Mat.clamp(15, 0, 10) + Mat.lerp(0, 100, 0.5)
         """;
         double result = O5ScriptEngine.EvalNum(src);
         Assert.Equal(76.0, result);
     }
 
     [Fact]
-    public void Math_DirectSubmoduleImportAndConstants() {
+    public void Mat_DirectSubmoduleImportAndConstants() {
         string src = """
-        con Math = @("std.math");
-        Math.sin(0) + Math.pi
+        con Mat = @("std.mat");
+        Mat.sin(0) + Mat.pi
         """;
         double result = O5ScriptEngine.EvalNum(src);
         Assert.Equal(Math.PI, result);

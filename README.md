@@ -24,7 +24,7 @@ Ultra-fast, zero-allocation, compiled scripting language designed for in-game HU
 - **Tag Direct Binding**:
   - Function delegate: `tag Name => Func;`
   - Block tags: `tag Name => { ... }` (implicit return of last expression)
-- **Zero Pollution**: No global built-in functions. Modules imported at compile time via `@("std")` and `@("std.math")`.
+- **Zero Pollution**: No global built-in functions. Modules imported at compile time via `@("std")` and `@("std.mat")`.
 - **Cross-Platform Dual Runtime**:
   - Native Zig execution engine (`libo5script.so` / `o5script.dll`) + standalone CLI (`o5s`).
   - High-performance C# / .NET bindings (`O5ScriptEngine`).
@@ -48,7 +48,7 @@ Tested on Linux x86_64 against native Zig compiled with `-OReleaseFast` (LLVM -O
 ## Quick Example
 
 ```o5s
-con Math = @("std.math");
+con Mat = @("std.mat");
 sta counter = 0;
 
 // Struct with member methods (slf is automatically detected & passed by reference)

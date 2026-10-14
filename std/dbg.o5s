@@ -1,0 +1,13 @@
+// Declaration stub for @("std.dbg").
+// Not executed. Kept in sync with the compiler by test
+// "std declaration stubs compile".
+// Click-through anchor for future editor support:
+// `@("std.dbg")` maps to this file.
+
+con Dbg = @("std.dbg");
+
+// Dbg.out(v): append v + newline to the 256B host-drained buffer.
+// Returns 0. Named `out`, so it is documented here instead of declared:
+// `out` is a reserved keyword and cannot be a fun name.
+fun Dbg.in(): str => "";
+fun Dbg.asr(cond: num, msg: str): num => 0;

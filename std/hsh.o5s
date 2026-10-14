@@ -1,0 +1,9 @@
+// Declaration stub for @("std.hsh").
+// Not executed. Kept in sync with the compiler by test
+// "std declaration stubs compile".
+// Click-through anchor for future editor support:
+// `@("std.hsh")` maps to this file.
+
+con Hsh = @("std.hsh");
+
+fun Hsh.fnv(s: str): num => 0;
