@@ -187,4 +187,13 @@ internal static unsafe class NativeO5Script {
 
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern void o5s_reset_state(long h);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint o5s_dbg_take(byte* out_buf, nuint max_buf);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint o5s_dbg_feed(byte* in_ptr, nuint in_len);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void o5s_rng_seed(ulong seed);
 }

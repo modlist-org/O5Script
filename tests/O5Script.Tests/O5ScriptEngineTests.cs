@@ -332,5 +332,101 @@ public class O5ScriptEngineTests {
         double result = O5ScriptEngine.EvalNum(src);
         Assert.Equal(223.0, result); // x: 112 -> 0 (aliased), y: 223
     }
+
+    [Fact]
+    public void StdDbg_Out_DrainsInOrder() {
+        string src = """
+        con Dbg = @("std.dbg");
+        Dbg.out("hi");
+        Dbg.out(1.5);
+        0
+        """;
+        Assert.Equal(0.0, O5ScriptEngine.EvalNum(src));
+        Assert.Equal("hi\n1.5\n", O5ScriptEngine.DrainDebugOutput());
+        Assert.Equal(string.Empty, O5ScriptEngine.DrainDebugOutput());
+    }
+
+    [Fact]
+    public void StdDbg_In_Feed() {
+        O5ScriptEngine.FeedDebugInput("hey");
+        string result = O5ScriptEngine.EvalString("""
+        con Dbg = @("std.dbg");
+        Dbg.in()
+        """);
+        Assert.Equal("hey", result);
+    }
+
+    [Fact]
+    public void StdFmt_MiniPrintf() {
+        string result = O5ScriptEngine.EvalString("""
+        con Fmt = @("std.fmt");
+        Fmt.f("x={{}} d={{d}}", 1.5, 2.7)
+        """);
+        Assert.Equal("x=1.5 d=2", result);
+    }
+
+    [Fact]
+    public void StdRng_SeededRange() {
+        O5ScriptEngine.SeedRng(7);
+        double r = O5ScriptEngine.EvalNum("""
+        con Rng = @("std.rng");
+        Rng.range(10, 20)
+        """);
+        Assert.InRange(r, 10.0, 20.0);
+        O5ScriptEngine.SeedRng(7);
+        double r2 = O5ScriptEngine.EvalNum("""
+        con Rng = @("std.rng");
+        Rng.range(10, 20)
+        """);
+        Assert.Equal(r, r2);
+    }
+
+    [Fact]
+    public void StdStr_LenSubFindNum() {
+        double n = O5ScriptEngine.EvalNum("""
+        con Str = @("std.str");
+        Str.len("hello") + Str.find("hello", "ll") * 10
+        """);
+        Assert.Equal(25.0, n); // 5 + 2*10
+        string s = O5ScriptEngine.EvalString("""
+        con Str = @("std.str");
+        Str.sub("hello", 1, 4) + Str.num("12.5")
+        """);
+        Assert.Equal("ell12.5", s);
+    }
+
+    [Fact]
+    public void StdHsh_FnvVectors() {
+        double n = O5ScriptEngine.EvalNum("""
+        con Hsh = @("std.hsh");
+        Hsh.fnv("") + Hsh.fnv("foobar")
+        """);
+        Assert.Equal(5380871981.0, n);
+    }
+
+    [Fact]
+    public void StdNos_DeterministicRange() {
+        double n = O5ScriptEngine.EvalNum("""
+        con Nos = @("std.nos");
+        let a = Nos.per(1.5);
+        (a == Nos.per(1.5)) + (a >= -1 && a <= 1) * 2 + (a != Nos.per(0.0)) * 4
+        """);
+        Assert.Equal(7.0, n);
+    }
+
+    [Fact]
+    public void Dbg_Asr_PassAndTrap() {
+        double ok = O5ScriptEngine.EvalNum("""
+        con Dbg = @("std.dbg");
+        Dbg.asr(1, "unreached")
+        """);
+        Assert.Equal(0.0, ok);
+        double bad = O5ScriptEngine.EvalNum("""
+        con Dbg = @("std.dbg");
+        Dbg.asr(1 > 2, "boom")
+        """);
+        Assert.True(double.IsNaN(bad));
+        Assert.Equal("assert failed: boom\n", O5ScriptEngine.DrainDebugOutput());
+    }
 }
 

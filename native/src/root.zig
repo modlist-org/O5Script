@@ -101,6 +101,8 @@ export fn o5s_run(
             error.StepLimitExceeded => -4,
             error.OutOfBounds => -6,
             error.StringTooLong => -7,
+            error.InputEmpty => -8,
+            error.AssertionFailed => -9,
             else => -5,
         };
     };
@@ -132,6 +134,8 @@ export fn o5s_run_tag(
             error.StackOverflow => -3,
             error.StackUnderflow => -4,
             error.StepLimitExceeded => -5,
+            error.InputEmpty => -8,
+            error.AssertionFailed => -9,
             else => -6,
         };
     };
@@ -187,4 +191,20 @@ export fn o5s_host_tag_name(h: i64, host_idx: usize, out_buf: [*]u8, max_buf: us
 export fn o5s_reset_state(h: i64) void {
     const prog = progGet(h) orelse return;
     prog.resetState();
+}
+
+/// Drain the Dbg.out buffer: copy up to max_buf bytes out and clear it.
+/// Returns bytes copied.
+export fn o5s_dbg_take(out_buf: [*]u8, max_buf: usize) usize {
+    return vm.dbgTake(out_buf[0..max_buf]);
+}
+
+/// Feed the Dbg.in slot (truncated to 256B). Returns bytes stored.
+export fn o5s_dbg_feed(in_ptr: [*]const u8, in_len: usize) usize {
+    return vm.dbgFeed(in_ptr[0..in_len]);
+}
+
+/// Seed the Rng state (0 selects the default seed).
+export fn o5s_rng_seed(seed: u64) void {
+    vm.rngSeed(seed);
 }

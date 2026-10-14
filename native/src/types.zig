@@ -140,6 +140,20 @@ pub const Builtin = enum(u8) {
     pow = 16,
     log = 17,
     exp = 18,
+    dbg_out = 19,
+    dbg_in = 20,
+    fmt = 21,
+    rng_next = 22,
+    rng_range = 23,
+    rng_seed = 24,
+    str_len = 25,
+    str_sub = 26,
+    str_find = 27,
+    str_num = 28,
+    hsh_fnv = 29,
+    nos_per = 30,
+    nos_per2 = 31,
+    dbg_asr = 32,
 };
 
 pub const TagDef = struct {

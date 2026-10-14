@@ -791,11 +791,23 @@ op_call_builtin:
     lea rsi, [r11 + r10]
     mov [rbp - 72], r10
     call o5s_asm_builtin_call
+    test rdx, rdx
+    jnz .Lbuiltin_err
     mov r10, [rbp - 72]
-    sub r10, rax
+    add r10, rax
     lea r11, [rsp + 32768]
     lea r9, [rip + o5s_dispatch_table]
     DISPATCH_NEXT
+.Lbuiltin_err:
+    mov eax, edx
+    add rsp, 65544
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
 
 .p2align 4
 # The call arg packs target IP (low 32 bits) and frame shift in bytes (high 32).

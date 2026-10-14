@@ -68,6 +68,42 @@ fn printResult(res: vm.Value) void {
     }
 }
 
+fn drainDbgOut() void {
+    const n = vm.dbgOutLen();
+    if (n == 0) return;
+    var buf: [256]u8 = undefined;
+    const len = vm.dbgTake(buf[0..]);
+    if (len > 0) {
+        std.debug.print("{s}", .{buf[0..len]});
+    }
+}
+
+const max_in_retries: usize = 64;
+
+/// Run with Dbg.in support: on InputEmpty, snapshot-restore state, read one
+/// stdin line (blocking, CLI only), feed it, and rerun for exact-once semantics.
+fn runWithInput(prog: *vm.Prog, entry_ip: usize, allocator: std.mem.Allocator) vm.EvalError!vm.Value {
+    const saved_state = allocator.dupe(vm.Value, prog.state_slots) catch null;
+    defer if (saved_state) |s| allocator.free(s);
+    var in_buf: [256]u8 = undefined;
+    var retries: usize = 0;
+    while (true) {
+        const res = vm.run(prog, entry_ip, &[_]f64{}) catch |err| {
+            if (err != error.InputEmpty) return err;
+            if (retries >= max_in_retries) return err;
+            retries += 1;
+            if (saved_state) |s| @memcpy(prog.state_slots, s);
+            std.debug.print("in> ", .{});
+            const n = c_read(0, in_buf[0..].ptr, in_buf.len);
+            if (n <= 0) return err;
+            const line = std.mem.trim(u8, in_buf[0..@intCast(n)], "\r\n");
+            _ = vm.dbgFeed(line);
+            continue;
+        };
+        return res;
+    }
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = std.heap.c_allocator;
 
@@ -100,17 +136,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         defer prog.deinit();
 
-        const res = vm.run(prog, 0, &[_]f64{}) catch |err| {
+        const res = runWithInput(prog, 0, allocator) catch |err| {
             std.debug.print("Runtime error: {}\n", .{err});
             return;
         };
+        drainDbgOut();
 
         if (prog.tags.len == 0 or res.num != 0.0 or res.val_type == .str) {
             printResult(res);
         }
         if (prog.tags.len > 0) {
             for (prog.tags) |tag_def| {
-                const tag_res = vm.run(prog, tag_def.entry_ip, &[_]f64{}) catch continue;
+                const tag_res = runWithInput(prog, tag_def.entry_ip, allocator) catch continue;
+                drainDbgOut();
                 std.debug.print("[Tag: #{s}] => ", .{tag_def.name});
                 printResult(tag_res);
             }
@@ -138,10 +176,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         defer prog.deinit();
 
-        const res = vm.run(prog, 0, &[_]f64{}) catch |err| {
+        const res = runWithInput(prog, 0, allocator) catch |err| {
             std.debug.print("Error: {}\n", .{err});
             continue;
         };
+        drainDbgOut();
 
         printResult(res);
     }

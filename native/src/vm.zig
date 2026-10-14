@@ -29,6 +29,8 @@ pub const EvalError = error{
     OutOfBounds,
     StringTooLong,
     InvalidType,
+    InputEmpty,
+    AssertionFailed,
 };
 
 pub const Prog = struct {
@@ -117,6 +119,265 @@ extern fn o5s_vm_exec_x86_64(
 
 threadlocal var asm_scratch_pos: usize = 0;
 
+// ---- std.dbg / std.fmt / std.rng: fixed-size, stack-friendly state ----
+// No heap, no allocator. All buffers are statically bounded:
+// - dbg_out: single 256B append buffer drained by the host.
+// - dbg_in: single 256B slot fed by the host (consumed on read).
+// - rng: one u64 of xorshift64* state.
+threadlocal var dbg_out_buf: [types.max_str_len]u8 = undefined;
+threadlocal var dbg_out_len: usize = 0;
+threadlocal var dbg_in_buf: [types.max_str_len]u8 = undefined;
+threadlocal var dbg_in_len: usize = 0;
+threadlocal var rng_state: u64 = 0x9E3779B97F4A7C15;
+
+const rng_default_seed: u64 = 0x9E3779B97F4A7C15;
+
+pub fn rngSeed(s: u64) void {
+    rng_state = if (s == 0) rng_default_seed else s;
+}
+
+fn rngNextU64() u64 {
+    var x = rng_state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    rng_state = x;
+    return x *% 0x2545F4914F6CDD1D;
+}
+
+fn rngUnit() f64 {
+    return @as(f64, @floatFromInt(rngNextU64() >> 11)) * (1.0 / 9007199254740992.0);
+}
+
+fn appendValueDbg(v: Value) EvalError!void {
+    if (v.val_type == .str) {
+        appendString(&dbg_out_buf, &dbg_out_len, v.toSlice()) catch return EvalError.StringTooLong;
+    } else {
+        appendNumber(&dbg_out_buf, &dbg_out_len, v.num) catch return EvalError.StringTooLong;
+    }
+}
+
+/// Dbg.out(v): append value + '\n' to the fixed out-buffer. Traps on overflow.
+pub fn dbgOut(v: Value) EvalError!void {
+    try appendValueDbg(v);
+    if (dbg_out_len >= dbg_out_buf.len) return EvalError.StringTooLong;
+    dbg_out_buf[dbg_out_len] = '\n';
+    dbg_out_len += 1;
+}
+
+/// Dbg.in(): consume the fed input slot. Traps InputEmpty when nothing was fed.
+pub fn dbgInTake() EvalError!Value {
+    if (dbg_in_len == 0) return EvalError.InputEmpty;
+    const v = Value.fromStr(dbg_in_buf[0..dbg_in_len]);
+    dbg_in_len = 0;
+    return v;
+}
+
+/// Host drain: copy out-buffer out and clear it. Returns bytes copied.
+pub fn dbgTake(out: []u8) usize {
+    const n = @min(dbg_out_len, out.len);
+    @memcpy(out[0..n], dbg_out_buf[0..n]);
+    dbg_out_len = 0;
+    return n;
+}
+
+/// Host feed: fill the input slot (truncated to 256B). Returns bytes stored.
+pub fn dbgFeed(data: []const u8) usize {
+    const n = @min(data.len, dbg_in_buf.len);
+    @memcpy(dbg_in_buf[0..n], data[0..n]);
+    dbg_in_len = n;
+    return n;
+}
+
+pub fn dbgOutLen() usize {
+    return dbg_out_len;
+}
+
+/// Bitwise-op coercion mirroring x86 cvttsd2si saturation
+/// (NaN / out-of-range -> INT64_MIN). Fractionals truncate.
+fn f64ToI64Sat(v: f64) i64 {
+    if (math.isNan(v) or v >= 9223372036854775808.0 or v <= -9223372036854775808.0) {
+        return std.math.minInt(i64);
+    }
+    return @intFromFloat(v);
+}
+
+/// Str.len: byte length. Non-str is InvalidType (strict: no silent 0.0).
+fn strLen(v: Value) EvalError!f64 {
+    if (v.val_type != .str) return EvalError.InvalidType;
+    return @floatFromInt(v.str_len);
+}
+
+/// Str.sub(s, a, b): zero-copy byte slice [a, b). Out-of-range traps OutOfBounds.
+fn strSub(s: Value, a: f64, b: f64) EvalError!Value {
+    if (s.val_type != .str) return EvalError.InvalidType;
+    const len: f64 = @floatFromInt(s.str_len);
+    if (math.isNan(a) or math.isNan(b)) return EvalError.OutOfBounds;
+    if (a != @trunc(a) or b != @trunc(b)) return EvalError.OutOfBounds;
+    if (a < 0 or b < 0 or a > b or b > len) return EvalError.OutOfBounds;
+    const ai: usize = @intFromFloat(a);
+    const bi: usize = @intFromFloat(b);
+    return Value.fromStr(s.toSlice()[ai..bi]);
+}
+
+/// Str.find(s, sub): byte index or -1. Empty needle matches at 0.
+fn strFind(s: Value, sub: Value) EvalError!f64 {
+    if (s.val_type != .str or sub.val_type != .str) return EvalError.InvalidType;
+    const hay = s.toSlice();
+    const ndl = sub.toSlice();
+    if (ndl.len == 0) return 0.0;
+    if (ndl.len > hay.len) return -1.0;
+    var i: usize = 0;
+    while (i + ndl.len <= hay.len) : (i += 1) {
+        if (std.mem.eql(u8, hay[i .. i + ndl.len], ndl)) return @floatFromInt(i);
+    }
+    return -1.0;
+}
+
+/// Str.num(s): parse decimal, invalid -> NaN (never traps).
+fn strNum(v: Value) EvalError!f64 {
+    if (v.val_type != .str) return EvalError.InvalidType;
+    return std.fmt.parseFloat(f64, v.toSlice()) catch std.math.nan(f64);
+}
+
+/// Hsh.fnv(s): FNV-1a 32-bit over bytes, exact in f64.
+fn hshFnv(v: Value) EvalError!f64 {
+    if (v.val_type != .str) return EvalError.InvalidType;
+    var h: u32 = 2166136261;
+    for (v.toSlice()) |byte| {
+        h ^= byte;
+        h *%= 16777619;
+    }
+    return @floatFromInt(h);
+}
+
+fn nosHash(ix: i32, iy: i32) u32 {
+    var h: u64 = @as(u64, @bitCast(@as(i64, ix))) *% 0x9E3779B97F4A7C15 +% @as(u64, @bitCast(@as(i64, iy)));
+    h ^= h >> 30;
+    h *%= 0xBF58476D1CE4E5B9;
+    h ^= h >> 27;
+    h *%= 0x94D049BB133111EB;
+    h ^= h >> 31;
+    return @truncate(h);
+}
+
+fn nosLattice(ix: i32, iy: i32) f64 {
+    return @as(f64, @floatFromInt(nosHash(ix, iy))) / 4294967296.0 * 2.0 - 1.0;
+}
+
+fn nosFade(f: f64) f64 {
+    return f * f * (3.0 - 2.0 * f);
+}
+
+/// Deterministic value noise in [-1, 1]. Coordinates wrap mod 1024
+/// (keeps int casts UB-free for arbitrary finite inputs).
+fn nosPer(x: f64) f64 {
+    if (!std.math.isFinite(x)) return 0.0 * x;
+    const fl = @floor(x);
+    const fx = @mod(fl, 1024.0);
+    const ix: i32 = @intFromFloat(@floor(fx));
+    const f = x - fl;
+    const t = nosFade(f);
+    return nosLattice(ix, 0) * (1.0 - t) + nosLattice(ix + 1, 0) * t;
+}
+
+fn nosPer2(x: f64, y: f64) f64 {
+    if (!std.math.isFinite(x) or !std.math.isFinite(y)) return std.math.nan(f64);
+    const xfl = @floor(x);
+    const yfl = @floor(y);
+    const fx = @mod(xfl, 1024.0);
+    const fy = @mod(yfl, 1024.0);
+    const ix: i32 = @intFromFloat(@floor(fx));
+    const iy: i32 = @intFromFloat(@floor(fy));
+    const u = nosFade(x - xfl);
+    const v = nosFade(y - yfl);
+    const a = nosLattice(ix, iy) * (1.0 - u) + nosLattice(ix + 1, iy) * u;
+    const b = nosLattice(ix, iy + 1) * (1.0 - u) + nosLattice(ix + 1, iy + 1) * u;
+    return a * (1.0 - v) + b * v;
+}
+
+/// Dbg.asr failure note (best effort single line, then trap regardless).
+fn asrNote(msg: ?Value) void {
+    appendString(&dbg_out_buf, &dbg_out_len, "assert failed") catch {};
+    if (msg) |m| {
+        if (m.val_type == .str and m.str_len > 0) {
+            appendString(&dbg_out_buf, &dbg_out_len, ": ") catch {};
+            appendString(&dbg_out_buf, &dbg_out_len, m.toSlice()) catch {};
+        }
+    }
+    if (dbg_out_len < dbg_out_buf.len) {
+        dbg_out_buf[dbg_out_len] = '\n';
+        dbg_out_len += 1;
+    }
+}
+
+/// Mini printf into a fixed buffer: `{}` = next arg, `{d}` = truncated int,
+/// `{{` / `}}` = literal braces. Unknown `{...}` is copied literally,
+/// missing args render as "". Traps StringTooLong on overflow.
+pub fn fmtInto(out: []u8, fmt: []const u8, args: []const Value) EvalError!usize {
+    var pos: usize = 0;
+    var ai: usize = 0;
+    var i: usize = 0;
+    while (i < fmt.len) {
+        const c = fmt[i];
+        if (c == '{') {
+            if (i + 1 < fmt.len and fmt[i + 1] == '{') {
+                if (pos >= out.len) return EvalError.StringTooLong;
+                out[pos] = '{';
+                pos += 1;
+                i += 2;
+                continue;
+            }
+            var j = i + 1;
+            while (j < fmt.len and fmt[j] != '}') : (j += 1) {}
+            if (j >= fmt.len) {
+                // Unterminated '{': literal.
+                if (pos >= out.len) return EvalError.StringTooLong;
+                out[pos] = '{';
+                pos += 1;
+                i += 1;
+                continue;
+            }
+            const spec = fmt[i + 1 .. j];
+            if (spec.len == 0 or std.mem.eql(u8, spec, "d")) {
+                if (ai < args.len) {
+                    const arg = args[ai];
+                    if (arg.val_type == .str) {
+                        if (spec.len == 0) {
+                            appendString(out, &pos, arg.toSlice()) catch return EvalError.StringTooLong;
+                        }
+                        // `{d}` on str renders as "".
+                    } else {
+                        const n = if (spec.len == 0) arg.num else @trunc(arg.num);
+                        appendNumber(out, &pos, n) catch return EvalError.StringTooLong;
+                    }
+                }
+                // Missing args render as "".
+                ai += 1;
+            } else {
+                // Unknown spec: copy literally including braces.
+                if (pos + spec.len + 2 > out.len) return EvalError.StringTooLong;
+                out[pos] = '{';
+                @memcpy(out[pos + 1 .. pos + 1 + spec.len], spec);
+                out[pos + 1 + spec.len] = '}';
+                pos += spec.len + 2;
+            }
+            i = j + 1;
+        } else if (c == '}' and i + 1 < fmt.len and fmt[i + 1] == '}') {
+            if (pos >= out.len) return EvalError.StringTooLong;
+            out[pos] = '}';
+            pos += 1;
+            i += 2;
+        } else {
+            if (pos >= out.len) return EvalError.StringTooLong;
+            out[pos] = c;
+            pos += 1;
+            i += 1;
+        }
+    }
+    return pos;
+}
+
 export fn o5s_asm_str_add(l: *Value, r: *Value) callconv(.{ .x86_64_sysv = .{} }) void {
     const scratch = &thread_scratch;
     if (asm_scratch_pos + 1024 > scratch.len) {
@@ -158,44 +419,160 @@ export fn o5s_asm_str_copy(v: *Value) callconv(.{ .x86_64_sysv = .{} }) void {
     v.* = Value.fromStr(scratch[start_pos .. start_pos + v.str_len]);
 }
 
-export fn o5s_asm_builtin_call(packed_arg: i64, stack_top: [*]Value) callconv(.{ .x86_64_sysv = .{} }) usize {
+/// Shared Fmt.f implementation: args[0] is the format string.
+/// Result borrows the thread scratch ring (same lifetime rules as `+`).
+fn builtinFmt(args: []const Value) EvalError!Value {
+    const scratch = &thread_scratch;
+    if (asm_scratch_pos + types.max_str_len > scratch.len) {
+        asm_scratch_pos = 0;
+    }
+    const start_pos = asm_scratch_pos;
+    const out = scratch[start_pos .. start_pos + types.max_str_len];
+    var num_buf: [64]u8 = undefined;
+    const fmt_slice: []const u8 = if (args[0].val_type == .str)
+        args[0].toSlice()
+    else blk: {
+        var pos: usize = 0;
+        appendNumber(&num_buf, &pos, args[0].num) catch return EvalError.StringTooLong;
+        break :blk num_buf[0..pos];
+    };
+    const len = try fmtInto(out, fmt_slice, args[1..]);
+    asm_scratch_pos += types.max_str_len;
+    return Value.fromStr(scratch[start_pos .. start_pos + len]);
+}
+
+/// Result protocol for o5s_asm_builtin_call: err == 0 on success with a
+/// SIGNED stack delta (positive pushes, e.g. +24 for arity-0 producers);
+/// err < 0 carries the negated VM error code (-7 StringTooLong, -8 InputEmpty).
+pub const AsmBuiltinRes = extern struct {
+    delta: i64,
+    err: i64,
+};
+
+export fn o5s_asm_builtin_call(packed_arg: i64, stack_top: [*]Value) callconv(.{ .x86_64_sysv = .{} }) AsmBuiltinRes {
+    const ok = struct {
+        fn r(delta: i64) AsmBuiltinRes {
+            return .{ .delta = delta, .err = 0 };
+        }
+    }.r;
+    const fail = struct {
+        fn e(code: i64) AsmBuiltinRes {
+            return .{ .delta = 0, .err = code };
+        }
+    }.e;
     const builtin_id: Builtin = @enumFromInt(@as(u8, @truncate(@as(u64, @bitCast(packed_arg)))));
     const arity: u8 = @truncate(@as(u64, @bitCast(packed_arg)) >> 8);
+    // fmt is variadic (format string + up to 7 args): dispatch before arity.
+    if (builtin_id == .fmt) {
+        const n: usize = @max(arity, 1);
+        const args = (stack_top - n)[0..n];
+        const res = builtinFmt(args) catch return fail(-7);
+        (stack_top - n)[0] = res;
+        return ok(-@as(i64, @intCast((n - 1) * 24)));
+    }
+    // Dbg.asr(cond[, msg]): trap AssertionFailed (-9) with a buffer note.
+    if (builtin_id == .dbg_asr) {
+        if (arity < 1 or arity > 2) return fail(-5);
+        const cond = (stack_top - arity)[0];
+        if (!cond.isTruthy()) {
+            const msg: ?Value = if (arity == 2) (stack_top - 1)[0] else null;
+            asrNote(msg);
+            return fail(-9);
+        }
+        (stack_top - arity)[0] = Value.fromNum(0.0);
+        const n: usize = arity;
+        return ok(-@as(i64, @intCast((n - 1) * 24)));
+    }
+    if (arity == 0) {
+        switch (builtin_id) {
+            .dbg_in => {
+                stack_top[0] = dbgInTake() catch return fail(-8);
+                return ok(24);
+            },
+            .rng_next => {
+                stack_top[0] = Value.fromNum(rngUnit());
+                return ok(24);
+            },
+            else => {
+                stack_top[0] = Value.fromNum(0.0);
+                return ok(24);
+            },
+        }
+    }
     if (arity == 1) {
         const ptr = stack_top - 1;
         const arg0 = ptr[0].num;
-        const res = switch (builtin_id) {
-            .sin => @sin(arg0),
-            .cos => @cos(arg0),
-            .tan => @tan(arg0),
-            .asin => math.asin(arg0),
-            .acos => math.acos(arg0),
-            .atan => math.atan(arg0),
-            .sqrt => @sqrt(arg0),
-            .abs => @abs(arg0),
-            .floor => @floor(arg0),
-            .ceil => @ceil(arg0),
-            .round => @round(arg0),
-            .log => @log(arg0),
-            .exp => @exp(arg0),
-            else => arg0,
-        };
-        ptr[0] = Value.fromNum(res);
-        return 0;
+        switch (builtin_id) {
+            .dbg_out => {
+                dbgOut(ptr[0]) catch return fail(-7);
+                ptr[0] = Value.fromNum(0.0);
+                return ok(0);
+            },
+            .rng_seed => {
+                rngSeed(@as(u64, @bitCast(arg0)));
+                ptr[0] = Value.fromNum(0.0);
+                return ok(0);
+            },
+            .str_len => {
+                ptr[0] = Value.fromNum(strLen(ptr[0]) catch return fail(-5));
+                return ok(0);
+            },
+            .str_num => {
+                ptr[0] = Value.fromNum(strNum(ptr[0]) catch return fail(-5));
+                return ok(0);
+            },
+            .hsh_fnv => {
+                ptr[0] = Value.fromNum(hshFnv(ptr[0]) catch return fail(-5));
+                return ok(0);
+            },
+            .nos_per => {
+                ptr[0] = Value.fromNum(nosPer(arg0));
+                return ok(0);
+            },
+            else => {
+                const res = switch (builtin_id) {
+                    .sin => @sin(arg0),
+                    .cos => @cos(arg0),
+                    .tan => @tan(arg0),
+                    .asin => math.asin(arg0),
+                    .acos => math.acos(arg0),
+                    .atan => math.atan(arg0),
+                    .sqrt => @sqrt(arg0),
+                    .abs => @abs(arg0),
+                    .floor => @floor(arg0),
+                    .ceil => @ceil(arg0),
+                    .round => @round(arg0),
+                    .log => @log(arg0),
+                    .exp => @exp(arg0),
+                    else => arg0,
+                };
+                ptr[0] = Value.fromNum(res);
+                return ok(0);
+            },
+        }
     } else if (arity == 2) {
         const ptr1 = stack_top - 1;
         const ptr0 = stack_top - 2;
         const arg1 = ptr1[0].num;
         const arg0 = ptr0[0].num;
+        if (builtin_id == .str_find) {
+            ptr0[0] = Value.fromNum(strFind(ptr0[0], ptr1[0]) catch return fail(-5));
+            return ok(-24);
+        }
+        if (builtin_id == .nos_per2) {
+            ptr0[0] = Value.fromNum(nosPer2(arg0, arg1));
+            return ok(-24);
+        }
         const res = switch (builtin_id) {
             .atan2 => math.atan2(arg0, arg1),
             .min => @min(arg0, arg1),
             .max => @max(arg0, arg1),
             .pow => math.pow(f64, arg0, arg1),
+            .rng_range => arg0 + (arg1 - arg0) * rngUnit(),
             else => 0.0,
         };
         ptr0[0] = Value.fromNum(res);
-        return 24;
+        return ok(-24);
     } else if (arity == 3) {
         const ptr2 = stack_top - 1;
         const ptr1 = stack_top - 2;
@@ -203,15 +580,22 @@ export fn o5s_asm_builtin_call(packed_arg: i64, stack_top: [*]Value) callconv(.{
         const arg2 = ptr2[0].num;
         const arg1 = ptr1[0].num;
         const arg0 = ptr0[0].num;
+        if (builtin_id == .str_sub) {
+            ptr0[0] = strSub(ptr0[0], arg1, arg2) catch |err| return fail(switch (err) {
+                error.OutOfBounds => -6,
+                else => -5,
+            });
+            return ok(-48);
+        }
         const res = switch (builtin_id) {
             .clamp => math.clamp(arg0, arg1, arg2),
             .lerp => math.lerp(arg0, arg1, arg2),
             else => 0.0,
         };
         ptr0[0] = Value.fromNum(res);
-        return 48;
+        return ok(-48);
     }
-    return 0;
+    return ok(0);
 }
 
 pub fn run(
@@ -232,7 +616,22 @@ pub fn run(
             };
         } else if (ret_code == -6) {
             return EvalError.OutOfBounds;
+        } else if (ret_code == -2) {
+            return EvalError.StackOverflow;
+        } else if (ret_code == -3) {
+            return EvalError.StackUnderflow;
+        } else if (ret_code == -4) {
+            return EvalError.StepLimitExceeded;
+        } else if (ret_code == -7) {
+            return EvalError.StringTooLong;
+        } else if (ret_code == -8) {
+            return EvalError.InputEmpty;
+        } else if (ret_code == -9) {
+            return EvalError.AssertionFailed;
         }
+        // Never fall through: re-executing in the interpreter would
+        // double all side effects (dbg buffer, rng state, sta slots).
+        return EvalError.InvalidOpcode;
     }
 
     const scratch = &thread_scratch;
@@ -346,7 +745,9 @@ pub fn run(
                 const top = stack[sp - 1];
                 if (top.val_type != .num) return EvalError.InvalidType;
                 const bound: f64 = @floatFromInt(op.arg);
-                if (top.num < 0.0 or top.num >= bound) {
+                // NOTE: NaN comparisons are all false, so check explicitly:
+                // without this, @intFromFloat(NaN) below is UB in release.
+                if (math.isNan(top.num) or top.num < 0.0 or top.num >= bound) {
                     return EvalError.OutOfBounds;
                 }
                 const idx_int: i64 = @intFromFloat(top.num);
@@ -482,8 +883,8 @@ pub fn run(
                 const r = stack[sp - 1];
                 const l = stack[sp - 2];
                 sp -= 1;
-                const a: i64 = @intFromFloat(l.num);
-                const b: i64 = @intFromFloat(r.num);
+                const a: i64 = f64ToI64Sat(l.num);
+                const b: i64 = f64ToI64Sat(r.num);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(a & b));
             },
 
@@ -492,8 +893,8 @@ pub fn run(
                 const r = stack[sp - 1];
                 const l = stack[sp - 2];
                 sp -= 1;
-                const a: i64 = @intFromFloat(l.num);
-                const b: i64 = @intFromFloat(r.num);
+                const a: i64 = f64ToI64Sat(l.num);
+                const b: i64 = f64ToI64Sat(r.num);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(a | b));
             },
 
@@ -502,15 +903,15 @@ pub fn run(
                 const r = stack[sp - 1];
                 const l = stack[sp - 2];
                 sp -= 1;
-                const a: i64 = @intFromFloat(l.num);
-                const b: i64 = @intFromFloat(r.num);
+                const a: i64 = f64ToI64Sat(l.num);
+                const b: i64 = f64ToI64Sat(r.num);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(a ^ b));
             },
 
             .bit_not => {
                 if (sp < 1) return EvalError.StackUnderflow;
                 const top = stack[sp - 1];
-                const a: i64 = @intFromFloat(top.num);
+                const a: i64 = f64ToI64Sat(top.num);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(~a));
             },
 
@@ -519,8 +920,8 @@ pub fn run(
                 const r = stack[sp - 1];
                 const l = stack[sp - 2];
                 sp -= 1;
-                const a: i64 = @intFromFloat(l.num);
-                const shift: u6 = @truncate(@as(u64, @bitCast(@as(i64, @intFromFloat(r.num)))) & 63);
+                const a: i64 = f64ToI64Sat(l.num);
+                const shift: u6 = @truncate(@as(u64, @bitCast(f64ToI64Sat(r.num))) & 63);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(a << shift));
             },
 
@@ -529,8 +930,8 @@ pub fn run(
                 const r = stack[sp - 1];
                 const l = stack[sp - 2];
                 sp -= 1;
-                const a: i64 = @intFromFloat(l.num);
-                const shift: u6 = @truncate(@as(u64, @bitCast(@as(i64, @intFromFloat(r.num)))) & 63);
+                const a: i64 = f64ToI64Sat(l.num);
+                const shift: u6 = @truncate(@as(u64, @bitCast(f64ToI64Sat(r.num))) & 63);
                 stack[sp - 1] = Value.fromNum(@floatFromInt(a >> shift));
             },
 
@@ -627,25 +1028,65 @@ pub fn run(
                 const arity: u8 = @truncate(@as(u64, @bitCast(op.arg)) >> 8);
                 if (sp < arity) return EvalError.StackUnderflow;
 
-                if (arity == 1) {
-                    const arg0 = stack[sp - 1].num;
-                    const res = switch (builtin_id) {
-                        .sin => @sin(arg0),
-                        .cos => @cos(arg0),
-                        .tan => @tan(arg0),
-                        .asin => math.asin(arg0),
-                        .acos => math.acos(arg0),
-                        .atan => math.atan(arg0),
-                        .sqrt => @sqrt(arg0),
-                        .abs => @abs(arg0),
-                        .floor => @floor(arg0),
-                        .ceil => @ceil(arg0),
-                        .round => @round(arg0),
-                        .log => @log(arg0),
-                        .exp => @exp(arg0),
-                        else => arg0,
-                    };
-                    stack[sp - 1] = Value.fromNum(res);
+                // fmt is variadic (format string + up to 7 args): dispatch before arity.
+                if (builtin_id == .fmt) {
+                    const n: usize = @max(arity, 1);
+                    const res = try builtinFmt(stack[sp - n .. sp]);
+                    sp -= n - 1;
+                    stack[sp - 1] = res;
+                } else if (builtin_id == .dbg_asr) {
+                    if (arity < 1 or arity > 2) return EvalError.StackUnderflow;
+                    const cond = stack[sp - arity];
+                    if (!cond.isTruthy()) {
+                        const msg: ?Value = if (arity == 2) stack[sp - 1] else null;
+                        asrNote(msg);
+                        return EvalError.AssertionFailed;
+                    }
+                    sp -= arity - 1;
+                    stack[sp - 1] = Value.fromNum(0.0);
+                } else if (arity == 0) {
+                    if (sp >= max_stack) return EvalError.StackOverflow;
+                    switch (builtin_id) {
+                        .dbg_in => stack[sp] = try dbgInTake(),
+                        .rng_next => stack[sp] = Value.fromNum(rngUnit()),
+                        else => stack[sp] = Value.fromNum(0.0),
+                    }
+                    sp += 1;
+                } else if (arity == 1) {
+                    switch (builtin_id) {
+                        .dbg_out => {
+                            try dbgOut(stack[sp - 1]);
+                            stack[sp - 1] = Value.fromNum(0.0);
+                        },
+                        .rng_seed => {
+                            rngSeed(@as(u64, @bitCast(stack[sp - 1].num)));
+                            stack[sp - 1] = Value.fromNum(0.0);
+                        },
+                        .str_len => stack[sp - 1] = Value.fromNum(try strLen(stack[sp - 1])),
+                        .str_num => stack[sp - 1] = Value.fromNum(try strNum(stack[sp - 1])),
+                        .hsh_fnv => stack[sp - 1] = Value.fromNum(try hshFnv(stack[sp - 1])),
+                        .nos_per => stack[sp - 1] = Value.fromNum(nosPer(stack[sp - 1].num)),
+                        else => {
+                            const arg0 = stack[sp - 1].num;
+                            const res = switch (builtin_id) {
+                                .sin => @sin(arg0),
+                                .cos => @cos(arg0),
+                                .tan => @tan(arg0),
+                                .asin => math.asin(arg0),
+                                .acos => math.acos(arg0),
+                                .atan => math.atan(arg0),
+                                .sqrt => @sqrt(arg0),
+                                .abs => @abs(arg0),
+                                .floor => @floor(arg0),
+                                .ceil => @ceil(arg0),
+                                .round => @round(arg0),
+                                .log => @log(arg0),
+                                .exp => @exp(arg0),
+                                else => arg0,
+                            };
+                            stack[sp - 1] = Value.fromNum(res);
+                        },
+                    }
                 } else if (arity == 2) {
                     const arg1 = stack[sp - 1].num;
                     const arg0 = stack[sp - 2].num;
@@ -655,9 +1096,16 @@ pub fn run(
                         .min => @min(arg0, arg1),
                         .max => @max(arg0, arg1),
                         .pow => math.pow(f64, arg0, arg1),
+                        .rng_range => arg0 + (arg1 - arg0) * rngUnit(),
                         else => 0.0,
                     };
-                    stack[sp - 1] = Value.fromNum(res);
+                    if (builtin_id == .str_find) {
+                        stack[sp - 1] = Value.fromNum(try strFind(stack[sp - 1], stack[sp]));
+                    } else if (builtin_id == .nos_per2) {
+                        stack[sp - 1] = Value.fromNum(nosPer2(arg0, arg1));
+                    } else {
+                        stack[sp - 1] = Value.fromNum(res);
+                    }
                 } else if (arity == 3) {
                     const arg2 = stack[sp - 1].num;
                     const arg1 = stack[sp - 2].num;
@@ -668,7 +1116,12 @@ pub fn run(
                         .lerp => math.lerp(arg0, arg1, arg2),
                         else => 0.0,
                     };
-                    stack[sp - 1] = Value.fromNum(res);
+                    if (builtin_id == .str_sub) {
+                        // stack[sp-1] is now the first arg (s); arg1/arg2 were nums.
+                        stack[sp - 1] = try strSub(stack[sp - 1], arg1, arg2);
+                    } else {
+                        stack[sp - 1] = Value.fromNum(res);
+                    }
                 }
             },
 
@@ -729,7 +1182,12 @@ pub fn run(
                 const min_val: i32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(op.arg)))));
                 const count: u32 = @truncate(@as(u64, @bitCast(op.arg)) >> 32);
                 const val_f = val_v.num;
-                const val_i: i64 = @intFromFloat(val_f);
+                // Mirror the asm path (cvttsd2si saturates to INT64_MIN):
+                // non-representable values fall through to the default arm.
+                const val_i: i64 = if (math.isNan(val_f) or val_f >= 9223372036854775808.0 or val_f <= -9223372036854775808.0)
+                    std.math.minInt(i64)
+                else
+                    @intFromFloat(val_f);
                 if (val_f == @as(f64, @floatFromInt(val_i)) and val_i >= min_val and val_i < @as(i64, min_val) + @as(i64, count)) {
                     const idx: usize = @intCast(val_i - min_val);
                     ip = @intCast(ops[ip + 1 + idx].arg);

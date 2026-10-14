@@ -1373,6 +1373,338 @@ test "nested multi-slot struct frame allocation" {
     try std.testing.expectEqual(@as(f64, 16.0), res.num);
 }
 
+test "std.dbg out buffer and take" {
+    const allocator = std.testing.allocator;
+    var drain: [256]u8 = undefined;
+    _ = vm.dbgTake(drain[0..]); // isolate from other tests
+    const src =
+        \\con Dbg = @("std.dbg");
+        \\Dbg.out("hi");
+        \\Dbg.out(42);
+        \\0
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 0.0), res.num);
+    const n = vm.dbgTake(drain[0..]);
+    try std.testing.expectEqualStrings("hi\n42\n", drain[0..n]);
+    // drained: second take is empty
+    try std.testing.expectEqual(@as(usize, 0), vm.dbgTake(drain[0..]));
+}
+
+test "std.dbg in feed consume and empty trap" {
+    const allocator = std.testing.allocator;
+    _ = vm.dbgFeed("abc");
+    const src =
+        \\con Dbg = @("std.dbg");
+        \\Dbg.in()
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqualStrings("abc", res.toSlice());
+    // consumed: second read traps InputEmpty
+    try std.testing.expectError(error.InputEmpty, vm.run(prog, 0, &[_]f64{}));
+}
+
+test "std.dbg out overflow traps StringTooLong" {
+    const allocator = std.testing.allocator;
+    var drain: [256]u8 = undefined;
+    _ = vm.dbgTake(drain[0..]);
+    const src =
+        \\con Dbg = @("std.dbg");
+        \\Dbg.out("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        \\Dbg.out("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        \\0
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    try std.testing.expectError(error.StringTooLong, vm.run(prog, 0, &[_]f64{}));
+    _ = vm.dbgTake(drain[0..]);
+}
+
+test "std.fmt mini printf" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\con Fmt = @("std.fmt");
+        \\Fmt.f("x={{}} y={{d}} lit={{literal}} miss={{}}!", 1.5, 2.7)
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqualStrings("x=1.5 y=2 lit={literal} miss=!", res.toSlice());
+}
+
+test "std.fmt arg cap" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.TooManyLocals, compiler.compileSource(
+        \\con Fmt = @("std.fmt");
+        \\Fmt.f("{{}}", 1, 2, 3, 4, 5, 6, 7, 8)
+    , allocator));
+}
+
+test "std.rng sequence range reseed" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\con Rng = @("std.rng");
+        \\Rng.seed(7);
+        \\let a = Rng.next();
+        \\let b = Rng.next();
+        \\let r = Rng.range(10, 20);
+        \\Rng.seed(7);
+        \\let a2 = Rng.next();
+        \\(a != b) + (a == a2) * 2 + (r >= 10 && r < 20) * 4
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // distinct draws, deterministic reseed, range bounds
+    try std.testing.expectEqual(@as(f64, 7.0), res.num);
+}
+
+test "std.str len sub find num" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\con Str = @("std.str");
+        \\Str.len("hello") + Str.find("hello", "ll") * 10 + Str.find("hello", "z") * 100
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // 5 + 2*10 + (-1)*100 = -75
+    try std.testing.expectEqual(@as(f64, -75.0), res.num);
+
+    const src2 =
+        \\con Str = @("std.str");
+        \\Str.sub("hello", 1, 4) + "|" + Str.num("12.5")
+    ;
+    const prog2 = try compiler.compileSource(src2, allocator);
+    defer prog2.deinit();
+
+    const res2 = try vm.run(prog2, 0, &[_]f64{});
+    try std.testing.expectEqualStrings("ell|12.5", res2.toSlice());
+
+    // invalid num parses to NaN (NaN != NaN)
+    const prog3 = try compiler.compileSource(
+        \\con Str = @("std.str");
+        \\Str.num("abc") != Str.num("abc")
+    , allocator);
+    defer prog3.deinit();
+    const v3 = try vm.run(prog3, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 1.0), v3.num);
+}
+
+test "std.str sub bounds trap" {
+    const allocator = std.testing.allocator;
+    const trap_srcs = [_][]const u8{
+        \\con Str = @("std.str");
+        \\Str.sub("hi", 0, 5)
+        ,
+        \\con Str = @("std.str");
+        \\Str.sub("hi", 2, 1)
+        ,
+        \\con Str = @("std.str");
+        \\Str.sub("hi", 0.5, 1)
+        ,
+    };
+    for (trap_srcs) |src| {
+        const prog = try compiler.compileSource(src, allocator);
+        defer prog.deinit();
+        try std.testing.expectError(error.OutOfBounds, vm.run(prog, 0, &[_]f64{}));
+    }
+}
+
+test "std.hsh fnv vectors" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\con Hsh = @("std.hsh");
+        \\Hsh.fnv("") + Hsh.fnv("foobar")
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    // FNV-1a 32: "" = 2166136261, "foobar" = 3214735720
+    try std.testing.expectEqual(@as(f64, 5380871981.0), res.num);
+}
+
+test "std.nos deterministic range" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\con Nos = @("std.nos");
+        \\let a = Nos.per(1.5);
+        \\let b = Nos.per(1.5);
+        \\let c = Nos.per2(3.25, -7.5);
+        \\(a == b) + (a >= -1 && a <= 1) * 2 + (c >= -1 && c <= 1) * 4 + (Nos.per(0/0) != Nos.per(0/0)) * 8 + (a != Nos.per(0.0)) * 16
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 31.0), res.num);
+}
+
+test "dbg.asr pass trap and note" {
+    const allocator = std.testing.allocator;
+    var drain: [256]u8 = undefined;
+    _ = vm.dbgTake(drain[0..]);
+    const prog = try compiler.compileSource(
+        \\con Dbg = @("std.dbg");
+        \\Dbg.asr(1, "unreached")
+    , allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 0.0), res.num);
+    try std.testing.expectEqual(@as(usize, 0), vm.dbgTake(drain[0..]));
+
+    const prog2 = try compiler.compileSource(
+        \\con Dbg = @("std.dbg");
+        \\Dbg.asr(1 > 2, "boom")
+    , allocator);
+    defer prog2.deinit();
+    try std.testing.expectError(error.AssertionFailed, vm.run(prog2, 0, &[_]f64{}));
+    const n = vm.dbgTake(drain[0..]);
+    try std.testing.expectEqualStrings("assert failed: boom\n", drain[0..n]);
+}
+
+test "ub array index NaN traps" {
+    const allocator = std.testing.allocator;
+    const prog = try compiler.compileSource(
+        \\let a = [10, 20, 30];
+        \\let i = 0/0;
+        \\a[i]
+    , allocator);
+    defer prog.deinit();
+    // Must be OutOfBounds, never a safety panic / UB.
+    try std.testing.expectError(error.OutOfBounds, vm.run(prog, 0, &[_]f64{}));
+}
+
+test "ub jmp NaN and huge hit default" {
+    const allocator = std.testing.allocator;
+    // NOTE: bare `jmp ...` is a statement (no value); bind it to read arms.
+    const src =
+        \\let r = jmp 0/0 {
+        \\    1 => 10,
+        \\    2 => 20,
+        \\    _ => 99
+        \\};
+        \\r
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 99.0), res.num);
+
+    const prog2 = try compiler.compileSource(
+        \\let r = jmp 1000000000000000000000000000000 {
+        \\    1 => 10,
+        \\    2 => 20,
+        \\    _ => 99
+        \\};
+        \\r
+    , allocator);
+    defer prog2.deinit();
+    const res2 = try vm.run(prog2, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 99.0), res2.num);
+}
+
+test "ub bitwise saturate like cvttsd2si" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\let nan_and = (0/0) & 255;
+        \\let inf_or = (1/0) | 0;
+        \\let huge_and = 1000000000000000000000000000000 & 255;
+        \\let frac = 5.5 & 3;
+        \\(nan_and == 0) + (inf_or == -9223372036854775808) * 2 + (huge_and == 0) * 4 + (frac == 1) * 8
+    ;
+    const prog = try compiler.compileSource(src, allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 15.0), res.num);
+}
+
+test "ub fmt hostile inputs" {
+    const allocator = std.testing.allocator;
+    // lone brace arrives via runtime slice (compile-time {{}} -> {})
+    const prog = try compiler.compileSource(
+        \\con Fmt = @("std.fmt");
+        \\con Str = @("std.str");
+        \\Fmt.f(Str.sub("{{}}", 0, 1))
+    , allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqualStrings("{", res.toSlice());
+
+    // {d} on NaN renders NaN, missing arg renders ""
+    const prog2 = try compiler.compileSource(
+        \\con Fmt = @("std.fmt");
+        \\Fmt.f("{{d}}|{{}}", 0/0)
+    , allocator);
+    defer prog2.deinit();
+    const res2 = try vm.run(prog2, 0, &[_]f64{});
+    try std.testing.expectEqualStrings("NaN|", res2.toSlice());
+
+    // output over 256B traps (200 + 100 > 256)
+    const prog3 = try compiler.compileSource(
+        \\con Fmt = @("std.fmt");
+        \\Fmt.f("{{}}{{}}", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    , allocator);
+    defer prog3.deinit();
+    try std.testing.expectError(error.StringTooLong, vm.run(prog3, 0, &[_]f64{}));
+}
+
+test "ub str hostile inputs" {
+    const allocator = std.testing.allocator;
+    const prog = try compiler.compileSource(
+        \\con Str = @("std.str");
+        \\(Str.num("") != Str.num("")) + (Str.find("", "") == 0) * 2
+    , allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 3.0), res.num);
+
+    // overlong feed truncates to 256, no crash
+    var big: [300]u8 = undefined;
+    @memset(big[0..], 'z');
+    try std.testing.expectEqual(@as(usize, 256), vm.dbgFeed(big[0..]));
+    const prog2 = try compiler.compileSource(
+        \\con Str = @("std.str");
+        \\con Dbg = @("std.dbg");
+        \\Str.len(Dbg.in())
+    , allocator);
+    defer prog2.deinit();
+    const res2 = try vm.run(prog2, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 256.0), res2.num);
+}
+
+test "ub rng hostile inputs" {
+    const allocator = std.testing.allocator;
+    const prog = try compiler.compileSource(
+        \\con Rng = @("std.rng");
+        \\Rng.seed(0/0);
+        \\let a = Rng.next();
+        \\let r = Rng.range(5, 5);
+        \\(a >= 0 && a < 1) + (r == 5) * 2
+    , allocator);
+    defer prog.deinit();
+    const res = try vm.run(prog, 0, &[_]f64{});
+    try std.testing.expectEqual(@as(f64, 3.0), res.num);
+}
+
+test "ub bad array dimension" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.DimensionMismatch, compiler.compileSource(
+        \\let a: [100000000000000000000]num = [1];
+    , allocator));
+}
+
 test "slf compile errors" {
     const allocator = std.testing.allocator;
     // slf outside a stu method

@@ -160,6 +160,11 @@ Registers tags directly for the Overlayer engine:
 
 O5Script has **no global built-in functions** to prevent scope pollution and maintain strict zero-cost abstractions. All math and system utilities must be explicitly imported via compile-time module bindings using `@("...")`.
 
+**nostd**: not importing anything *is* nostd. Module bindings resolve entirely at
+compile time, so a script with no `@("std...")` import emits zero std-related
+bytecode by construction. Game scripts stay import-free; `std.*` exists for
+CLI testing and general-purpose fun.
+
 ### Module Syntax
 - Import standard library:
   ```o5s
@@ -174,6 +179,78 @@ O5Script has **no global built-in functions** to prevent scope pollution and mai
 ### `Std.Math` Functions & Constants
 - Functions: `Math.sin(x)`, `Math.cos(x)`, `Math.tan(x)`, `Math.asin(x)`, `Math.acos(x)`, `Math.atan(x)`, `Math.atan2(y, x)`, `Math.sqrt(x)`, `Math.abs(x)`, `Math.floor(x)`, `Math.ceil(x)`, `Math.round(x)`, `Math.min(a, b)`, `Math.max(a, b)`, `Math.clamp(v, min, max)`, `Math.lerp(a, b, t)`, `Math.pow(a, b)`, `Math.log(x)`, `Math.exp(x)`
 - Constants (compile-time folded): `Math.pi`, `Math.e`, `Math.tau`
+
+### `Std.Dbg` (Debug I/O, Host-Drained)
+Opt-in debug output/input. The VM never performs I/O itself: `out` appends to a
+fixed 256B buffer the host drains (`o5s_dbg_take` / `DrainDebugOutput`), and
+`in` reads a fixed 256B slot the host feeds (`o5s_dbg_feed` / `FeedDebugInput`).
+Game (nostd) builds simply never import this module.
+- `Dbg.out(v)`: Appends `v` + newline to the out-buffer. Returns `0`. Exceeding
+  256B traps `StringTooLong`. The host must drain; undrained output accumulates.
+- `Dbg.in()`: Returns the fed input line as `str` and consumes it. Traps
+  `InputEmpty` when nothing was fed (the CLI catches this, reads one stdin line
+  blocking, feeds it, and reruns with snapshot-restored state).
+
+```o5s
+con Dbg = @("std.dbg");
+Dbg.out("tick");
+Dbg.out(Dbg.in());
+```
+
+### `Std.Fmt` (Mini Printf)
+Runtime string formatting (compile-time `"x={x}"` interpolation is separate).
+`Fmt.f(fmtstr, args...)` supports at most 8 total operands (format string +
+up to 7 args); more is a compile error. Placeholders: `{}` (next arg),
+`{d}` (truncated integer), `{{` / `}}` (literal braces). Note: `{}` must be
+written `{{}}` in source so compile-time interpolation leaves it intact.
+Unknown `{...}` is copied literally, missing args render as `""`, and results
+over 256B trap `StringTooLong`.
+
+```o5s
+con Fmt = @("std.fmt");
+Fmt.f("pos={{}} hp={{d}}", 1.5, 99.9) // "pos=1.5 hp=99"
+```
+
+### `Std.Rng` (Deterministic PRNG)
+Stack-friendly xorshift64* with one `u64` of thread-local state (zero heap).
+State persists across runs; default seed is fixed for reproducibility.
+- `Rng.next()`: `num` in `[0, 1)`.
+- `Rng.range(lo, hi)`: `num` in `[lo, hi)`.
+- `Rng.seed(n)`: Reseeds (`0` selects the default). Returns `0`. Hosts can also
+  seed via `o5s_rng_seed` / `SeedRng`.
+
+```o5s
+con Rng = @("std.rng");
+Rng.seed(7);
+Rng.range(10, 20)
+```
+
+### `Std.Str` (String Utilities)
+Byte-oriented (strings are UTF-8 bytes; indices are byte offsets).
+- `Str.len(s)`: byte length.
+- `Str.sub(s, a, b)`: zero-copy slice `[a, b)`. Out-of-range traps `OutOfBounds`.
+- `Str.find(s, sub)`: first index or `-1` (empty needle matches at `0`).
+- `Str.num(s)`: parse decimal; invalid input yields `NaN` (never traps).
+  Non-`str` arguments trap `InvalidType`.
+
+```o5s
+con Str = @("std.str");
+Str.sub("hello", 1, 4) // "ell"
+```
+
+### `Std.Hsh` (Hashing)
+- `Hsh.fnv(s)`: FNV-1a 32-bit over bytes, exact in `num`. Use for tag dispatch
+  or seed derivation (`Rng.seed(Hsh.fnv(name))`).
+
+### `Std.Nos` (Deterministic Noise)
+Stack-friendly value noise in `[-1, 1]` for HUD wobble and procedural motion.
+Integer-lattice hashed, zero state; coordinates wrap mod 1024.
+- `Nos.per(x)`, `Nos.per2(x, y)`.
+- Non-finite input propagates `NaN` (never traps).
+
+### `Dbg.Asr` (Assert)
+- `Dbg.asr(cond[, msg])`: traps `AssertionFailed` when `cond` is falsy, after
+  appending `assert failed[: msg]` to the drain buffer. Returns `0`.
 
 ---
 

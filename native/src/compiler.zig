@@ -582,6 +582,12 @@ pub const Compiler = struct {
     pub const ModuleKind = enum {
         std,
         math,
+        dbg,
+        fmt,
+        rng,
+        str,
+        hsh,
+        nos,
     };
 
     pub const ModuleBinding = struct {
@@ -1393,6 +1399,9 @@ pub const Compiler = struct {
         while (self.match(.l_bracket)) {
             has_array = true;
             if (self.cur.tag != .number) return error.ExpectedArrayDimension;
+            if (std.math.isNan(self.cur.num_val) or self.cur.num_val < 0 or self.cur.num_val >= 4294967296.0) {
+                return error.DimensionMismatch;
+            }
             const dim: u32 = @intFromFloat(self.cur.num_val);
             self.advance();
             if (!self.match(.r_bracket)) return error.ExpectedClosingBracket;
@@ -1478,6 +1487,9 @@ pub const Compiler = struct {
             var dim_idx: usize = 0;
             while (self.match(.l_bracket)) {
                 if (self.cur.tag != .number) return error.ExpectedArrayDimension;
+                if (std.math.isNan(self.cur.num_val) or self.cur.num_val < 0 or self.cur.num_val >= 4294967296.0) {
+                    return error.DimensionMismatch;
+                }
                 const d: u32 = @intFromFloat(self.cur.num_val);
                 self.advance();
                 if (!self.match(.r_bracket)) return error.ExpectedClosingBracket;
@@ -1989,6 +2001,10 @@ pub const Compiler = struct {
             if (!can_table) break;
         }
         if (can_table and (max_val - min_val >= 64 or min_val < -128)) {
+            can_table = false;
+        }
+        // intFromFloat below traps on out-of-range: keep the table in i32.
+        if (can_table and (min_val < -2147483648.0 or max_val > 2147483647.0)) {
             can_table = false;
         }
 
@@ -2700,6 +2716,24 @@ pub const Compiler = struct {
                     } else if (std.ascii.eqlIgnoreCase(path, "std.math")) {
                         self.addModule(name, .math);
                         return;
+                    } else if (std.ascii.eqlIgnoreCase(path, "std.dbg")) {
+                        self.addModule(name, .dbg);
+                        return;
+                    } else if (std.ascii.eqlIgnoreCase(path, "std.fmt")) {
+                        self.addModule(name, .fmt);
+                        return;
+                    } else if (std.ascii.eqlIgnoreCase(path, "std.rng")) {
+                        self.addModule(name, .rng);
+                        return;
+                    } else if (std.ascii.eqlIgnoreCase(path, "std.str")) {
+                        self.addModule(name, .str);
+                        return;
+                    } else if (std.ascii.eqlIgnoreCase(path, "std.hsh")) {
+                        self.addModule(name, .hsh);
+                        return;
+                    } else if (std.ascii.eqlIgnoreCase(path, "std.nos")) {
+                        self.addModule(name, .nos);
+                        return;
                     }
                     return;
                 }
@@ -2715,6 +2749,42 @@ pub const Compiler = struct {
                             self.advance();
                             _ = self.match(.semicolon);
                             self.addModule(name, .math);
+                            return;
+                        }
+                        if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "dbg")) {
+                            self.advance();
+                            _ = self.match(.semicolon);
+                            self.addModule(name, .dbg);
+                            return;
+                        }
+                        if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "fmt")) {
+                            self.advance();
+                            _ = self.match(.semicolon);
+                            self.addModule(name, .fmt);
+                            return;
+                        }
+                        if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "rng")) {
+                            self.advance();
+                            _ = self.match(.semicolon);
+                            self.addModule(name, .rng);
+                            return;
+                        }
+                        if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "str")) {
+                            self.advance();
+                            _ = self.match(.semicolon);
+                            self.addModule(name, .str);
+                            return;
+                        }
+                        if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "hsh")) {
+                            self.advance();
+                            _ = self.match(.semicolon);
+                            self.addModule(name, .hsh);
+                            return;
+                        }
+                        if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "nos")) {
+                            self.advance();
+                            _ = self.match(.semicolon);
+                            self.addModule(name, .nos);
                             return;
                         }
                     }
@@ -3972,11 +4042,77 @@ pub const Compiler = struct {
                         self.last_expr_type = .num;
                         return;
                     }
+                    if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "dbg") and self.peek.tag == .dot) {
+                        self.advance();
+                        self.advance();
+                        try self.parseDbgMember();
+                        return;
+                    }
+                    if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "fmt") and self.peek.tag == .dot) {
+                        self.advance();
+                        self.advance();
+                        try self.parseFmtMember();
+                        return;
+                    }
+                    if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "rng") and self.peek.tag == .dot) {
+                        self.advance();
+                        self.advance();
+                        try self.parseRngMember();
+                        return;
+                    }
+                    if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "str") and self.peek.tag == .dot) {
+                        self.advance();
+                        self.advance();
+                        try self.parseStrMember();
+                        return;
+                    }
+                    if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "hsh") and self.peek.tag == .dot) {
+                        self.advance();
+                        self.advance();
+                        try self.parseHshMember();
+                        return;
+                    }
+                    if (self.cur.tag == .ident and std.ascii.eqlIgnoreCase(self.cur.text, "nos") and self.peek.tag == .dot) {
+                        self.advance();
+                        self.advance();
+                        try self.parseNosMember();
+                        return;
+                    }
                 } else if (mod == .math and self.peek.tag == .dot) {
                     self.advance();
                     self.advance();
                     try self.parseMathMember();
                     self.last_expr_type = .num;
+                    return;
+                } else if (mod == .dbg and self.peek.tag == .dot) {
+                    self.advance();
+                    self.advance();
+                    try self.parseDbgMember();
+                    return;
+                } else if (mod == .fmt and self.peek.tag == .dot) {
+                    self.advance();
+                    self.advance();
+                    try self.parseFmtMember();
+                    return;
+                } else if (mod == .rng and self.peek.tag == .dot) {
+                    self.advance();
+                    self.advance();
+                    try self.parseRngMember();
+                    return;
+                } else if (mod == .str and self.peek.tag == .dot) {
+                    self.advance();
+                    self.advance();
+                    try self.parseStrMember();
+                    return;
+                } else if (mod == .hsh and self.peek.tag == .dot) {
+                    self.advance();
+                    self.advance();
+                    try self.parseHshMember();
+                    return;
+                } else if (mod == .nos and self.peek.tag == .dot) {
+                    self.advance();
+                    self.advance();
+                    try self.parseNosMember();
                     return;
                 }
             }
@@ -4087,6 +4223,193 @@ pub const Compiler = struct {
             return;
         }
 
+        return error.SyntaxError;
+    }
+
+    fn emitBuiltinCall(self: *Compiler, id: Builtin, arg_count: u8) CompileError!void {
+        const packed_arg: i64 = @as(i64, @intFromEnum(id)) | (@as(i64, arg_count) << 8);
+        _ = try self.emit(.call_builtin, packed_arg);
+    }
+
+    fn parseDbgMember(self: *Compiler) CompileError!void {
+        // NOTE: `out` lexes as kw_out, so match on text, not tag.
+        if (self.cur.tag != .ident and self.cur.tag != .kw_out) return error.SyntaxError;
+        const member = self.cur.text;
+        self.advance();
+
+        if (std.ascii.eqlIgnoreCase(member, "out")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.dbg_out, 1);
+            self.last_expr_type = .num;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(member, "in")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.dbg_in, 0);
+            self.last_expr_type = .str;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(member, "asr")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            var arg_count: u8 = 1;
+            if (self.match(.comma)) {
+                try self.parseExpression();
+                arg_count = 2;
+            }
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.dbg_asr, arg_count);
+            self.last_expr_type = .num;
+            return;
+        }
+        return error.SyntaxError;
+    }
+
+    fn parseFmtMember(self: *Compiler) CompileError!void {
+        if (self.cur.tag != .ident) return error.SyntaxError;
+        const member = self.cur.text;
+        self.advance();
+
+        // Fmt.f(fmtstr, args...): total operands capped at 8 (stack-based).
+        if (std.ascii.eqlIgnoreCase(member, "f")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            var arg_count: u8 = 0;
+            while (self.cur.tag != .r_paren and self.cur.tag != .eof) {
+                if (arg_count >= 8) return error.TooManyLocals;
+                try self.parseExpression();
+                arg_count += 1;
+                if (!self.match(.comma)) break;
+            }
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            if (arg_count < 1) return error.SyntaxError;
+            try self.emitBuiltinCall(.fmt, arg_count);
+            self.last_expr_type = .str;
+            return;
+        }
+        return error.SyntaxError;
+    }
+
+    fn parseRngMember(self: *Compiler) CompileError!void {
+        if (self.cur.tag != .ident) return error.SyntaxError;
+        const member = self.cur.text;
+        self.advance();
+
+        if (std.ascii.eqlIgnoreCase(member, "next")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.rng_next, 0);
+            self.last_expr_type = .num;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(member, "range")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.comma)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.rng_range, 2);
+            self.last_expr_type = .num;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(member, "seed")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.rng_seed, 1);
+            self.last_expr_type = .num;
+            return;
+        }
+        return error.SyntaxError;
+    }
+
+    fn parseStrMember(self: *Compiler) CompileError!void {
+        if (self.cur.tag != .ident) return error.SyntaxError;
+        const member = self.cur.text;
+        self.advance();
+
+        if (std.ascii.eqlIgnoreCase(member, "len")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.str_len, 1);
+            self.last_expr_type = .num;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(member, "sub")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.comma)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.comma)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.str_sub, 3);
+            self.last_expr_type = .str;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(member, "find")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.comma)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.str_find, 2);
+            self.last_expr_type = .num;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(member, "num")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.str_num, 1);
+            self.last_expr_type = .num;
+            return;
+        }
+        return error.SyntaxError;
+    }
+
+    fn parseHshMember(self: *Compiler) CompileError!void {
+        if (self.cur.tag != .ident) return error.SyntaxError;
+        const member = self.cur.text;
+        self.advance();
+
+        if (std.ascii.eqlIgnoreCase(member, "fnv")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.hsh_fnv, 1);
+            self.last_expr_type = .num;
+            return;
+        }
+        return error.SyntaxError;
+    }
+
+    fn parseNosMember(self: *Compiler) CompileError!void {
+        if (self.cur.tag != .ident) return error.SyntaxError;
+        const member = self.cur.text;
+        self.advance();
+
+        if (std.ascii.eqlIgnoreCase(member, "per")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.nos_per, 1);
+            self.last_expr_type = .num;
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(member, "per2")) {
+            if (!self.match(.l_paren)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.comma)) return error.SyntaxError;
+            try self.parseExpression();
+            if (!self.match(.r_paren)) return error.SyntaxError;
+            try self.emitBuiltinCall(.nos_per2, 2);
+            self.last_expr_type = .num;
+            return;
+        }
         return error.SyntaxError;
     }
 
